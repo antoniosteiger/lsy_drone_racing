@@ -17,13 +17,15 @@ import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller
+from lsy_drone_racing.utils import load_config, load_controller, draw_line
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
 
     from lsy_drone_racing.control.controller import Controller
     from lsy_drone_racing.envs.drone_race import DroneRaceEnv
+
+import numpy as np # needed for np.array
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,7 @@ def simulate(
     controller: str | None = None,
     n_runs: int = 1,
     gui: bool | None = None,
-    trajectory_file: str | None = None,  # Custom parameter to pass a trajectory file
+    trajectory_file: str | None = None,  ### EXTENDED: Custom parameter to pass a trajectory file
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
@@ -54,10 +56,21 @@ def simulate(
         gui = config.sim.gui
     else:
         config.sim.gui = gui
+
     # Load the controller module
     control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
     controller_path = control_path / (controller or config.controller.file)
     controller_cls = load_controller(controller_path)  # This returns a class, not an instance
+
+    ### EXTENDED ###
+    # load trajectory points
+    if trajectory_file:
+        trajectory_path = Path(__file__).parents[1] / trajectory_file
+        # load points on trajectory
+        trajectory_points = np.loadtxt(trajectory_path, delimiter=",", usecols=(0, 1, 2))
+        # set trajectory line color
+        trajectory_color = np.array([1.0, 0, 0, 1])
+
     # Create the racing environment
     env: DroneRaceEnv = gymnasium.make(
         config.env.id,
@@ -70,41 +83,61 @@ def simulate(
         randomizations=config.env.get("randomizations"),
         seed=config.env.seed,
     )
+
     env = JaxToNumpy(env)
 
     ep_times = []
-    for _ in range(n_runs):  # Run n_runs episodes with the controller
-        obs, info = env.reset()
-        controller: Controller = controller_cls(obs, info, config)
+    
+    try:
+        for _ in range(n_runs):  # Run n_runs episodes with the controller
+            obs, info = env.reset()
+            controller: Controller = controller_cls(obs, info, config)
+            i = 0
+            fps = 60
+
+            while True:
+                curr_time = i / config.env.freq
+
+                action = controller.compute_control(obs, info)
+                obs, reward, terminated, truncated, info = env.step(action)
+                # Update the controller internal state and models.
+                controller_finished = controller.step_callback(
+                    action, obs, reward, terminated, truncated, info
+                )
+                # Add up reward, collisions
+                if terminated or truncated or controller_finished:
+                    break
+                # Synchronize the GUI.
+                if config.sim.gui:
+                    if ((i * fps) % config.env.freq) < fps:
+                        env.render()
+                        
+                        # EXTENDED: Draw trajectory line
+                        if trajectory_file:
+                            # draw the trajectory line
+                            draw_line(env, trajectory_points, trajectory_color)
+                i += 1
+
+            controller.episode_callback()  # Update the controller internal state and models.
+            log_episode_stats(obs, info, config, curr_time)
+            controller.episode_reset()
+            ep_times.append(curr_time if obs["target_gate"] == -1 else None)
+        
+        # EXTENDED: Keep GUI open
         i = 0
-        fps = 60
-
         while True:
-            curr_time = i / config.env.freq
-
-            action = controller.compute_control(obs, info)
-            obs, reward, terminated, truncated, info = env.step(action)
-            # Update the controller internal state and models.
-            controller_finished = controller.step_callback(
-                action, obs, reward, terminated, truncated, info
-            )
-            # Add up reward, collisions
-            if terminated or truncated or controller_finished:
-                break
-            # Synchronize the GUI.
-            if config.sim.gui:
-                if ((i * fps) % config.env.freq) < fps:
-                    env.render()
+            if ((i * fps) % config.env.freq) < fps:
+                env.render()
+                if trajectory_file:
+                    # draw the trajectory line
+                    draw_line(env, trajectory_points, trajectory_color)
             i += 1
-
-        controller.episode_callback()  # Update the controller internal state and models.
-        log_episode_stats(obs, info, config, curr_time)
-        controller.episode_reset()
-        ep_times.append(curr_time if obs["target_gate"] == -1 else None)
-
-    # Close the environment
-    env.close()
-    return ep_times
+    except KeyboardInterrupt:
+        print("Closing visualization.")
+    finally:
+        # Close the environment
+        env.close()
+        return ep_times
 
 
 def log_episode_stats(obs: dict, info: dict, config: ConfigDict, curr_time: float):

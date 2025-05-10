@@ -102,6 +102,7 @@ def draw_line(
     assert points.shape[-1] == 3, f"Points must be 3D, are {points.shape[-1]}"
     sim = env.unwrapped.sim
     if sim.viewer is None:  # Do not attempt to add markers if viewer is still None
+        print("Viewer is None, skipping line drawing.")
         return
     if sim.max_visual_geom < points.shape[0]:
         raise RuntimeError("Attempted to draw too many lines. Try to increase Sim.max_visual_geom")
