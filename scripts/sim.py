@@ -34,6 +34,7 @@ def simulate(
     controller: str | None = None,
     n_runs: int = 1,
     gui: bool | None = None,
+    trajectory_file: str | None = None,  # Custom parameter to pass a trajectory file
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
