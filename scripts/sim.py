@@ -67,7 +67,7 @@ def simulate(
     if trajectory_file:
         trajectory_path = Path(__file__).parents[1] / trajectory_file
         # load points on trajectory
-        trajectory_points = np.loadtxt(trajectory_path, delimiter=",", usecols=(1, 2, 3))
+        trajectory_points = np.loadtxt(trajectory_path, delimiter=",", usecols=(0, 1, 2))
         # set trajectory line color
         trajectory_color = np.array([1.0, 0, 0, 1])
 
