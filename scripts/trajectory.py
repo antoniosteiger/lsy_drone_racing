@@ -35,9 +35,8 @@ def render_trajectory(
     fps = 60
     try:
         while True:
-            if config.sim.gui:
-                if ((i * fps) % config.env.freq) < fps:
-                    env.render()
+            if ((i * fps) % config.env.freq) < fps:
+                env.render()
             i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")
