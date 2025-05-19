@@ -1,17 +1,28 @@
 from lsy_drone_racing.control import Controller
 import numpy as np
 from numpy.typing import NDArray
+from scipy.interpolate import interp1d
 
 
 class MinSnapTracker(Controller):
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
         
-        self.trajectory = np.loadtxt(config.trajectory_file, delimiter=",")
-        print("CONTROLLER: Trajectory points loaded")
         self._tick = 0
-        self._freq = config.env.freq
         self._finished = False
+
+        # Settings
+        self._freq = config.env.freq
+        self._t_total = 12.0
+        self._interpolation_factor = 3
+
+        # Load and interpolate trajectory
+        self.trajectory = np.loadtxt(config.trajectory_file, delimiter=",")
+        self.trajectory = interpolate_trajectory_linear(self.trajectory, self._interpolation_factor)
+        N = self.trajectory.shape[0]
+        #print("CONTROLLER: Trajectory points loaded")
+
+
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -70,3 +81,33 @@ def quat_to_euler(q):
     yaw = np.arctan2(siny_cosp, cosy_cosp)
 
     return np.array([roll, pitch, yaw], dtype=np.float32)
+
+def interpolate_trajectory_linear(trajectory, interpolation_factor=2):
+    """
+    Linearly interpolates between trajectory points.
+    
+    Parameters:
+        trajectory (np.ndarray): Original trajectory, shape (N, 13)
+        interpolation_factor (int): Number of segments per original segment.
+                                    Must be >= 1. (1 = no interpolation)
+
+    Returns:
+        np.ndarray: Interpolated trajectory
+    """
+    if interpolation_factor < 1:
+        raise ValueError("interpolation_factor must be >= 1")
+
+    N = trajectory.shape[0]
+    result = []
+
+    for i in range(N - 1):
+        a = trajectory[i]
+        b = trajectory[i + 1]
+
+        for k in range(interpolation_factor):
+            alpha = k / interpolation_factor
+            point = (1 - alpha) * a + alpha * b
+            result.append(point)
+
+    result.append(trajectory[-1])  # add the final point
+    return np.array(result)
