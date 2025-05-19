@@ -17,7 +17,7 @@ import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller, draw_line
+from lsy_drone_racing.utils import load_config, load_controller
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -50,6 +50,9 @@ def simulate(
     Returns:
         A list of episode times.
     """
+    if trajectory_file:
+        from lsy_drone_racing.utils import draw_line
+
     # Load configuration and check if firmare should be used.
     config = load_config(Path(__file__).parents[1] / "config" / config)
     if gui is None:

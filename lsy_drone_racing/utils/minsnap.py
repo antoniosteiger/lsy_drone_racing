@@ -9,7 +9,7 @@ refs = [
     # starting point
     ms.Waypoint(
         time= 0.0,
-        position=np.array([1.0, 1.5, 0.07]),
+        position=np.array([1.0, 1.5, 0.1]),
         velocity=np.array([0.0, 0.0, 0.0]),
         acceleration=np.array([0.0, 0.0, 0.0]),
         jerk=np.array([0.0, 0.0, 0.0])
@@ -26,7 +26,7 @@ refs = [
     # ),
     # second gate
     ms.Waypoint( 
-        time= 7.8,
+        time= 7.0,
         position=np.array([1.0, -1.05, 1.11]),
         velocity=np.array([0.4, 0.4, 0.0])
     ),
