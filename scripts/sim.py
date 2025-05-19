@@ -129,13 +129,14 @@ def simulate(
         
         # EXTENDED: Keep GUI open
         i = 0
-        while True:
-            if ((i * fps) % config.env.freq) < fps:
-                env.render()
-                if trajectory_file:
-                    # draw the trajectory line
-                    draw_line(env, trajectory_points, trajectory_color)
-            i += 1
+        if config.sim.gui:
+            while True:
+                if ((i * fps) % config.env.freq) < fps:
+                    env.render()
+                    if trajectory_file:
+                        # draw the trajectory line
+                        draw_line(env, trajectory_points, trajectory_color)
+                i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")
     finally:

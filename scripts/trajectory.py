@@ -12,7 +12,7 @@ def render_trajectory(
         config: str = "level0.toml",
 ):
     config = load_config(Path(__file__).parents[1] / "config" / config)
-    config.sim.gui = True
+    # config.sim.gui = True
     
     # Initialize the racing environment
     env: DroneRaceEnv = gymnasium.make(
