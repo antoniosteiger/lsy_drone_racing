@@ -44,7 +44,10 @@ refs = [
 ]
 
 
-if __name__ == "__main__":
+def generate_trajectory():
+    """
+    Generates a trajectory using the minsnap_trajectories library.
+    """
     polys = ms.generate_trajectory(
         refs,
         degree=8,  # Polynomial degree
@@ -67,5 +70,4 @@ if __name__ == "__main__":
     #print("States: ", states[0])
     #print("Inputs: ", inputs)
 
-    t_col = t.reshape(-1, 1)
-    np.savetxt('trajectory.csv', np.hstack([states, inputs, acceleration]), delimiter=',', fmt='%.6f')
+    return np.hstack([states, inputs, acceleration])

@@ -1,7 +1,15 @@
 from lsy_drone_racing.control import Controller
 import numpy as np
 from numpy.typing import NDArray
-from scipy.interpolate import interp1d
+import importlib
+from lsy_drone_racing.utils.minsnap import generate_trajectory
+
+# Try to import the live trajectory variable, else fail back to None silently
+_trajectory = importlib.util.find_spec("trajectory")
+if _trajectory:
+    trajectory = importlib.import_module("trajectory")
+else:
+    trajectory = None
 
 
 class MinSnapTracker(Controller):
@@ -17,7 +25,7 @@ class MinSnapTracker(Controller):
         self._interpolation_factor = 3
 
         # Load and interpolate trajectory
-        self.trajectory = np.loadtxt(config.trajectory_file, delimiter=",")
+        self.trajectory = generate_trajectory()
         self.trajectory = interpolate_trajectory_linear(self.trajectory, self._interpolation_factor)
         N = self.trajectory.shape[0]
         #print("CONTROLLER: Trajectory points loaded")
