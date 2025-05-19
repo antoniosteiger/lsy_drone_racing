@@ -29,7 +29,7 @@ class MinSnapTracker(Controller):
             acceleration = self.trajectory[self._tick, 14:17]
             rpy = quat_to_euler(attitude)
 
-            return np.concatenate((position, velocity, acceleration, np.zeros(1), angular), dtype=np.float32)
+            return np.concatenate((position, np.zeros(10)), dtype=np.float32)
             #return np.concatenate((thrust, rpy), dtype=np.float32)
 
     
