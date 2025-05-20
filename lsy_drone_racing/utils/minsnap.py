@@ -1,50 +1,10 @@
 import numpy as np
 import minsnap_trajectories as ms
 
-num_waypoints = 5
 freq = 20
-duration = 16.0
-
-refs = [
-    # starting point
-    ms.Waypoint(
-        time= 0.0,
-        position=np.array([1.0, 1.5, 0.1]),
-        velocity=np.array([0.0, 0.0, 0.0]),
-        acceleration=np.array([0.0, 0.0, 0.0]),
-        jerk=np.array([0.0, 0.0, 0.0])
-    ),
-    # first gate
-    ms.Waypoint(  # Any higher-order derivatives
-        time= 4.0,
-        position=np.array([0.4, -0.5, 0.56]),
-    ),
-    # intermediary
-    # ms.Waypoint(  # Any higher-order derivatives
-    #     time= 8.0,
-    #     position=np.array([0.35, -1.7, 0.85]),
-    # ),
-    # second gate
-    ms.Waypoint( 
-        time= 7.0,
-        position=np.array([1.0, -1.05, 1.11]),
-        velocity=np.array([0.4, 0.4, 0.0])
-    ),
-    # third gate
-    ms.Waypoint(
-        time= 12.0,
-        position=np.array([0.0, 1.2, 0.56]), # increased y to "touch gate"
-        velocity=np.array([0.0, 0.0, 0.0]),
-    ),
-    # fourth gate
-    ms.Waypoint(
-        time= duration,
-        position=np.array([-0.6, -0.2, 1.11]),
-    )
-]
 
 
-def generate_trajectory():
+def generate_trajectory(refs, duration):
     """
     Generates a trajectory using the minsnap_trajectories library.
     """

@@ -150,11 +150,12 @@ def log_episode_stats(obs: dict, info: dict, config: ConfigDict, curr_time: floa
         f"Flight time (s): {curr_time}\nFinished: {finished}\nGates passed: {gates_passed}\n"
     )
 
-def decimate(points, max_points=500):
-    if len(points) <= max_points:
-        return points
-    step = len(points) / max_points
-    return [points[int(i * step)] for i in range(max_points)]
+def decimate(arr: np.ndarray, max_len: int) -> np.ndarray:
+    length = len(arr)
+    if length <= max_len:
+        return arr
+    step = int(np.ceil(length / max_len))
+    return arr[::step]
 
 def draw_trajectory(env, trajectory, color):
     # Draw the trajectory line
