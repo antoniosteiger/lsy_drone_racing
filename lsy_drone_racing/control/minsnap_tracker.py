@@ -1,15 +1,8 @@
 from lsy_drone_racing.control import Controller
 import numpy as np
 from numpy.typing import NDArray
-import importlib
-from lsy_drone_racing.utils.minsnap import generate_trajectory
-
-# Try to import the live trajectory variable, else fail back to None silently
-_trajectory = importlib.util.find_spec("trajectory")
-if _trajectory:
-    trajectory = importlib.import_module("trajectory")
-else:
-    trajectory = None
+import lsy_drone_racing.utils.minsnap as minsnap
+import lsy_drone_racing.utils.trajectory as trajectory
 
 
 class MinSnapTracker(Controller):
@@ -22,31 +15,34 @@ class MinSnapTracker(Controller):
         # Settings
         self._freq = config.env.freq
         self._t_total = 12.0
-        self._interpolation_factor = 3
+        self._interpolation_factor = 1
 
-        # Load and interpolate trajectory
-        self.trajectory = generate_trajectory()
-        self.trajectory = interpolate_trajectory_linear(self.trajectory, self._interpolation_factor)
-        N = self.trajectory.shape[0]
-        #print("CONTROLLER: Trajectory points loaded")
+        # generate trajectory
+        trajectory.trajectory = minsnap.generate_trajectory()
+        print("MINSNAP: Trajectory generated")
 
+        # interpolate trajectory to regulate speed
+        trajectory.trajectory = interpolate_trajectory_linear(trajectory.trajectory, self._interpolation_factor)
+        print("MINSNAP: Trajectory interpolated")
 
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        if self._tick >= len(self.trajectory):
+        if self._tick >= len(trajectory.trajectory):
             self._finished = True
             return np.zeros(13, dtype=np.float32)
         else:
-            position = self.trajectory[self._tick, 0:3]
-            attitude = self.trajectory[self._tick, 3:7]
-            velocity = self.trajectory[self._tick, 7:10]
-            thrust = self.trajectory[self._tick, 10]
+            position = trajectory.trajectory[self._tick, 0:3]
+            attitude = trajectory.trajectory[self._tick, 3:7]
+            velocity = trajectory.trajectory[self._tick, 7:10]
+            thrust = trajectory.trajectory[self._tick, 10]
             thrust = np.array([thrust], dtype=np.float32)
-            angular = self.trajectory[self._tick, 11:14]
-            acceleration = self.trajectory[self._tick, 14:17]
+            angular = trajectory.trajectory[self._tick, 11:14]
+            acceleration = trajectory.trajectory[self._tick, 14:17]
             rpy = quat_to_euler(attitude)
+
+            print(obs["gates_pos"])
 
             return np.concatenate((position, np.zeros(10)), dtype=np.float32)
             #return np.concatenate((thrust, rpy), dtype=np.float32)

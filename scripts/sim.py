@@ -17,7 +17,8 @@ import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller
+from lsy_drone_racing.utils import load_config, load_controller, draw_line
+import lsy_drone_racing.utils.trajectory as trajectory
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -36,7 +37,7 @@ def simulate(
     controller: str | None = None,
     n_runs: int = 1,
     gui: bool | None = None,
-    trajectory_file: str | None = None,  ### EXTENDED: Custom parameter to pass a trajectory file
+    trajectory_visualization: bool | None = None,  ### EXTENDED: visualize trajectory or not
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
@@ -50,9 +51,13 @@ def simulate(
     Returns:
         A list of episode times.
     """
-    if trajectory_file:
-        from lsy_drone_racing.utils import draw_line
 
+    # Settings
+    trajectory_color = np.array([1.0, 0, 0, 1])
+
+    if trajectory_visualization:
+        print("SIM: Trajectory visualization enabled.")
+    
     # Load configuration and check if firmare should be used.
     config = load_config(Path(__file__).parents[1] / "config" / config)
     if gui is None:
@@ -64,16 +69,6 @@ def simulate(
     control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
     controller_path = control_path / (controller or config.controller.file)
     controller_cls = load_controller(controller_path)  # This returns a class, not an instance
-
-    ### EXTENDED ###
-    # load trajectory points
-    if trajectory_file:
-        trajectory_path = Path(__file__).parents[1] / trajectory_file
-        config.trajectory_file = trajectory_path
-        # load points on trajectory
-        trajectory_points = np.loadtxt(trajectory_path, delimiter=",", usecols=(0, 1, 2))
-        # set trajectory line color
-        trajectory_color = np.array([1.0, 0, 0, 1])
 
     # Create the racing environment
     env: DroneRaceEnv = gymnasium.make(
@@ -117,9 +112,9 @@ def simulate(
                         env.render()
                         
                         # EXTENDED: Draw trajectory line
-                        if trajectory_file:
+                        if trajectory_visualization:
                             # draw the trajectory line
-                            draw_line(env, trajectory_points, trajectory_color)
+                            draw_trajectory(env, trajectory.trajectory, trajectory_color)
                 i += 1
 
             controller.episode_callback()  # Update the controller internal state and models.
@@ -133,9 +128,9 @@ def simulate(
             while True:
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
-                    if trajectory_file:
+                    if trajectory_visualization:
                         # draw the trajectory line
-                        draw_line(env, trajectory_points, trajectory_color)
+                        draw_trajectory(env, trajectory.trajectory, trajectory_color)
                 i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")
@@ -154,6 +149,18 @@ def log_episode_stats(obs: dict, info: dict, config: ConfigDict, curr_time: floa
     logger.info(
         f"Flight time (s): {curr_time}\nFinished: {finished}\nGates passed: {gates_passed}\n"
     )
+
+def decimate(points, max_points=500):
+    if len(points) <= max_points:
+        return points
+    step = len(points) / max_points
+    return [points[int(i * step)] for i in range(max_points)]
+
+def draw_trajectory(env, trajectory, color):
+    # Draw the trajectory line
+    trajectory = trajectory[:, 0:3]  # Only take the x, y, z coordinates
+    trajectory = decimate(trajectory, 500)
+    draw_line(env, trajectory, color)
 
 
 if __name__ == "__main__":
