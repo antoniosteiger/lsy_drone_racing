@@ -17,7 +17,7 @@ import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller, draw_line
+from lsy_drone_racing.utils.utils import load_config, load_controller
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -112,11 +112,6 @@ def simulate(
                 if config.sim.gui:
                     if ((i * fps) % config.env.freq) < fps:
                         env.render()
-                        
-                        # EXTENDED: Draw trajectory line
-                        if trajectory_file:
-                            # draw the trajectory line
-                            draw_line(env, trajectory_points, trajectory_color)
                 i += 1
 
             controller.episode_callback()  # Update the controller internal state and models.
@@ -129,9 +124,6 @@ def simulate(
         while True:
             if ((i * fps) % config.env.freq) < fps:
                 env.render()
-                if trajectory_file:
-                    # draw the trajectory line
-                    draw_line(env, trajectory_points, trajectory_color)
             i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")

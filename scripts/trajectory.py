@@ -1,5 +1,5 @@
 # Time-Optimal Trajectory Generator
-from lsy_drone_racing.utils import load_config, draw_line
+from lsy_drone_racing.utils import load_config
 from lsy_drone_racing.envs.drone_race import DroneRaceEnv
 import gymnasium
 from pathlib import Path
