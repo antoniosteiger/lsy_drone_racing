@@ -14,12 +14,13 @@ class MinSnapTracker(Controller):
         self._finished = False
 
         # Settings
-        self._t_total = 12.5
+        self._t_total = 9.0
         self._freq = config.env.freq
-        self._interpolation_factor = 4
+        self._interpolation_factor = 2
 
         # generate trajectory
         self.current_gates_pos = np.copy(obs["gates_pos"])
+        self.initial_pos = np.copy(obs["pos"])
         #print(obs)
         trajectory.trajectory = minsnap.generate_trajectory(self.make_refs(), self._t_total)
         print("MINSNAP: Trajectory generated")
@@ -92,21 +93,34 @@ class MinSnapTracker(Controller):
     def make_refs(self):
         #self.current_gates_pos[2][1] += 0.13
         #self.current_gates_pos[3][1] -= 0.2
+        waypoint1 = self.initial_pos.copy() # starting point
+        # waypoint1[2] += 0.13 # clear the ground
+        # waypoint1[1] -= 0.2 # clear the ground
+
+        waypoint2 = self.current_gates_pos[0].copy() # first gate
+
+        waypoint3 = self.current_gates_pos[1].copy() # second gate
+
+        waypoint4 = self.current_gates_pos[2].copy() # third gate
+        waypoint4[1] += 0.25 # increased y to "touch gate"
+
+        waypoint5 = self.current_gates_pos[3].copy() # fourth gate
+        waypoint5[1] -= 0.2 # increased y to meet velocity threshold
         
         refs = [
             # starting point
             ms.Waypoint(
                 time= 0.0,
-                position=np.array([1.0, 1.5, 0.2]),
+                position=np.array(waypoint1),
                 velocity=np.array([0.0, 0.0, 0.0]),
                 acceleration=np.array([0.0, 0.0, 0.0]),
                 jerk=np.array([0.0, 0.0, 0.0])
             ),
             # first gate
             ms.Waypoint(  # Any higher-order derivatives
-                time= 4.0,
-                position=np.array(self.current_gates_pos[0]),
-                velocity=np.array([-0.6, -0.6, 0.0]),
+                time= 2.0,
+                position=np.array(waypoint2),
+                #velocity=np.array([-0.6, -0.6, 0.0]),
             ),
             # intermediary
             # ms.Waypoint(  # Any higher-order derivatives
@@ -115,26 +129,26 @@ class MinSnapTracker(Controller):
             # ),
             # second gate
             ms.Waypoint( 
-                time= 8.0,
-                position=np.array(self.current_gates_pos[1]),
-                velocity=np.array([0.6, 0.6, 0.0])
+                time= 4.0,
+                position=np.array(waypoint3),
+                velocity=np.array([0.8, 0.8, 0.0])
             ),
             # third gate
             ms.Waypoint(
-                time= 10.0,
-                position=np.array(self.current_gates_pos[2]), # increased y to "touch gate"
+                time= 6.7,
+                position=np.array(waypoint4), # increased y to "touch gate"
                 velocity=np.array([0.0, 0.0, 0.0]),
             ),
             # fourth gate
             ms.Waypoint(
-                time= 11.5,
-                position=np.array(self.current_gates_pos[3]),
-            ),
-            # endpoint
-            ms.Waypoint(
                 time= self._t_total,
-                position=np.array([-0.6, -0.4, 1.11]),
-            )
+                position=np.array(waypoint5),
+            ),
+            # # endpoint
+            # ms.Waypoint(
+            #     time= self._t_total,
+            #     position=np.array([-0.6, -0.4, 1.11]),
+            # )
         ]
 
         return refs
