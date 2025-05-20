@@ -13,59 +13,21 @@ class MinSnapTracker(Controller):
         self._tick = 0
         self._finished = False
 
-        # Waypoint Info
-        self._t_total = 16.0
-        self.refs = [
-            # starting point
-            ms.Waypoint(
-                time= 0.0,
-                position=np.array([1.0, 1.5, 0.2]),
-                velocity=np.array([0.0, 0.0, 0.0]),
-                acceleration=np.array([0.0, 0.0, 0.0]),
-                jerk=np.array([0.0, 0.0, 0.0])
-            ),
-            # first gate
-            ms.Waypoint(  # Any higher-order derivatives
-                time= 4.0,
-                position=np.array([0.4, -0.5, 0.56]),
-            ),
-            # intermediary
-            # ms.Waypoint(  # Any higher-order derivatives
-            #     time= 8.0,
-            #     position=np.array([0.35, -1.7, 0.85]),
-            # ),
-            # second gate
-            ms.Waypoint( 
-                time= 7.0,
-                position=np.array([1.0, -1.05, 1.11]),
-                velocity=np.array([0.4, 0.4, 0.0])
-            ),
-            # third gate
-            ms.Waypoint(
-                time= 12.0,
-                position=np.array([0.0, 1.2, 0.56]), # increased y to "touch gate"
-                velocity=np.array([0.0, 0.0, 0.0]),
-            ),
-            # fourth gate
-            ms.Waypoint(
-                time= self._t_total,
-                position=np.array([-0.6, -0.2, 1.11]),
-            )
-        ]
-
         # Settings
+        self._t_total = 12.5
         self._freq = config.env.freq
         self._interpolation_factor = 4
 
         # generate trajectory
-        trajectory.trajectory = minsnap.generate_trajectory(self.refs, self._t_total)
+        self.current_gates_pos = np.copy(obs["gates_pos"])
+        #print(obs)
+        trajectory.trajectory = minsnap.generate_trajectory(self.make_refs(), self._t_total)
         print("MINSNAP: Trajectory generated")
 
         # interpolate trajectory to regulate speed
         trajectory.trajectory = interpolate_trajectory_linear(trajectory.trajectory, self._interpolation_factor)
         print("MINSNAP: Trajectory interpolated")
 
-        self.current_gates_pos = np.copy(obs["gates_pos"])
         
 
 
@@ -110,6 +72,7 @@ class MinSnapTracker(Controller):
             True if the controller is finished, False otherwise.
         """
         self._tick += 1
+        #print(obs["target_gate"])
         return self._finished
     
     def is_obs_different(self, gates_pos):
@@ -119,8 +82,18 @@ class MinSnapTracker(Controller):
         return False
         
     def regenerate_trajectory(self):
-        print("MINSNAP: Regenerating trajectory")
-        self.refs = [
+        #print("MINSNAP: Regenerating trajectory")
+
+        trajectory.trajectory = minsnap.generate_trajectory(self.make_refs(), self._t_total)
+        trajectory.trajectory = interpolate_trajectory_linear(trajectory.trajectory, self._interpolation_factor)
+
+        return
+    
+    def make_refs(self):
+        #self.current_gates_pos[2][1] += 0.13
+        #self.current_gates_pos[3][1] -= 0.2
+        
+        refs = [
             # starting point
             ms.Waypoint(
                 time= 0.0,
@@ -132,7 +105,8 @@ class MinSnapTracker(Controller):
             # first gate
             ms.Waypoint(  # Any higher-order derivatives
                 time= 4.0,
-                position=np.array(self.current_gates_pos[0])
+                position=np.array(self.current_gates_pos[0]),
+                velocity=np.array([-0.6, -0.6, 0.0]),
             ),
             # intermediary
             # ms.Waypoint(  # Any higher-order derivatives
@@ -141,26 +115,29 @@ class MinSnapTracker(Controller):
             # ),
             # second gate
             ms.Waypoint( 
-                time= 7.0,
+                time= 8.0,
                 position=np.array(self.current_gates_pos[1]),
-                velocity=np.array([0.4, 0.4, 0.0])
+                velocity=np.array([0.6, 0.6, 0.0])
             ),
             # third gate
             ms.Waypoint(
-                time= 12.0,
+                time= 10.0,
                 position=np.array(self.current_gates_pos[2]), # increased y to "touch gate"
                 velocity=np.array([0.0, 0.0, 0.0]),
             ),
             # fourth gate
             ms.Waypoint(
-                time= self._t_total,
+                time= 11.5,
                 position=np.array(self.current_gates_pos[3]),
+            ),
+            # endpoint
+            ms.Waypoint(
+                time= self._t_total,
+                position=np.array([-0.6, -0.4, 1.11]),
             )
         ]
-        trajectory.trajectory = minsnap.generate_trajectory(self.refs, self._t_total)
-        trajectory.trajectory = interpolate_trajectory_linear(trajectory.trajectory, self._interpolation_factor)
 
-        return
+        return refs
 
     
 def quat_to_euler(q):
