@@ -96,6 +96,7 @@ def simulate(
 
             while True:
                 curr_time = i / config.env.freq
+                
 
                 action = controller.compute_control(obs, info)
                 obs, reward, terminated, truncated, info = env.step(action)

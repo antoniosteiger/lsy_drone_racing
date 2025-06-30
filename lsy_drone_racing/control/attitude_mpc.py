@@ -1,314 +1,306 @@
-"""This module implements an example MPC using attitude control for a quadrotor.
-
-It utilizes the collective thrust interface for drone control to compute control commands based on
-current state observations and desired waypoints.
-
-The waypoints are generated using cubic spline interpolation from a set of predefined waypoints.
-Note that the trajectory uses pre-defined waypoints instead of dynamically generating a good path.
-"""
-
-from __future__ import annotations  # Python 3.10 type hints
-
-from typing import TYPE_CHECKING
-
+from __future__ import annotations
+from typing import TYPE_CHECKING, List, Tuple
 import numpy as np
-import scipy
+import scipy.linalg
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
-from casadi import MX, cos, sin, vertcat
-from lsy_models.utils.constants import Constants
+from casadi import MX, cos, sin, vertcat, norm_2
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
-
 from lsy_drone_racing.control import Controller
+import logging
 
+logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+    from ml_collections import ConfigDict
 
-constants = Constants.from_config("cf2x_L250")
+# ------------------------------------------------------------------------------
+# |  Constants
+# ------------------------------------------------------------------------------
+MASS        = 0.5
+GRAVITY_VEC = np.array([0.0, 0.0, -9.81])
+SI_ACC      = [0.0, 5.0]
+SI_PARAMS   = np.array([[-2, 3], [-2, 3], [-1, 2]])
+THRUST_MIN  = 0.1
+THRUST_MAX  = 1.0
+OBSTACLE_RADIUS = 0.3  # default obstacle radius
+GATE_RADIUS     = 0.3  # gate constraint radius
 
+# ------------------------------------------------------------------------------
+# |  Trajectory: Minimum Jerk via CubicSpline
+# ------------------------------------------------------------------------------
+class MinimumJerkTrajectory:
+    def __init__(self, waypoints: NDArray[np.floating], times: NDArray[np.floating]):
+        self.dim    = waypoints.shape[1]
+        self.times  = times.copy()
+        self.splines = [CubicSpline(times, waypoints[:, i], bc_type='clamped') for i in range(self.dim)]
+        self.t_start = times[0]
+        self.t_end   = times[-1]
 
+    def evaluate(self, t: float) -> Tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
+        t_clipped = float(np.clip(t, self.t_start, self.t_end))
+        pos = np.array([s(t_clipped)    for s in self.splines])
+        vel = np.array([s(t_clipped, 1) for s in self.splines])
+        acc = np.array([s(t_clipped, 2) for s in self.splines])
+        return pos, vel, acc
+
+# ------------------------------------------------------------------------------
+# |  Quadrotor ODE Model
+# ------------------------------------------------------------------------------
 def export_quadrotor_ode_model() -> AcadosModel:
-    """Symbolic Quadrotor Model."""
-    # Define name of solver to be used in script
-    model_name = "lsy_example_mpc"
+    model    = AcadosModel()
+    model.name = "dynamic_mpc_quad"
 
-    """Model setting"""
-    # define basic variables in state and input vector
-    px = MX.sym("px")
-    py = MX.sym("py")
-    pz = MX.sym("pz")
-    pos = vertcat(px, py, pz)
-    vx = MX.sym("vx")
-    vy = MX.sym("vy")
-    vz = MX.sym("vz")
-    vel = vertcat(vx, vy, vz)
-    roll = MX.sym("r")
-    pitch = MX.sym("p")
-    yaw = MX.sym("y")
-    rpy = vertcat(roll, pitch, yaw)
+    # states
+    px, py, pz       = MX.sym('px'), MX.sym('py'), MX.sym('pz')
+    vx, vy, vz       = MX.sym('vx'), MX.sym('vy'), MX.sym('vz')
+    r, p, y          = MX.sym('r'), MX.sym('p'), MX.sym('y')
+    states           = vertcat(px,py,pz, vx,vy,vz, r,p,y)
 
-    r_cmd = MX.sym("r_cmd")
-    p_cmd = MX.sym("p_cmd")
-    y_cmd = MX.sym("y_cmd")
-    thrust_cmd = MX.sym("thrust_cmd")
+    # inputs
+    rc, pc, yc, tc   = MX.sym('r_cmd'), MX.sym('p_cmd'), MX.sym('y_cmd'), MX.sym('thrust_cmd')
+    inputs           = vertcat(rc, pc, yc, tc)
 
-    # define state and input vector
-    states = vertcat(pos, vel, rpy)
-    inputs = vertcat(r_cmd, p_cmd, y_cmd, thrust_cmd)
-
-    # Define nonlinear system dynamics
+    # dynamics
     pos_dot = vertcat(vx, vy, vz)
-    z_axis = vertcat(
-        cos(roll) * sin(pitch) * cos(yaw) + sin(roll) * sin(yaw),
-        cos(roll) * sin(pitch) * sin(yaw) - sin(roll) * cos(yaw),
-        cos(roll) * cos(pitch),
+    z_body  = vertcat(
+        cos(r)*sin(p)*cos(y) + sin(r)*sin(y),
+        cos(r)*sin(p)*sin(y) - sin(r)*cos(y),
+        cos(r)*cos(p),
     )
-    thrust = constants.SI_ACC[0] + constants.SI_ACC[1] * inputs[3]
-    vel_dot = thrust * z_axis / constants.MASS + constants.GRAVITY_VEC
-    rpy_dot = constants.SI_PARAMS[:, 0] * rpy + constants.SI_PARAMS[:, 1] * inputs[:3]
-    f = vertcat(pos_dot, vel_dot, rpy_dot)
+    thrust  = SI_ACC[0] + SI_ACC[1]*tc
+    vel_dot = thrust*z_body/MASS + GRAVITY_VEC
+    rpy_dot = SI_PARAMS[:,0]*vertcat(r,p,y) + SI_PARAMS[:,1]*vertcat(rc,pc,yc)
 
-    # Initialize the nonlinear model for NMPC formulation
-    model = AcadosModel()
-    model.name = model_name
-    model.f_expl_expr = f
+    f_expl = vertcat(pos_dot, vel_dot, rpy_dot)
+    model.x           = states
+    model.u           = inputs
+    model.f_expl_expr = f_expl
     model.f_impl_expr = None
-    model.x = states
-    model.u = inputs
-
     return model
 
-
-def create_ocp_solver(
-    Tf: float, N: int, verbose: bool = False
+# ------------------------------------------------------------------------------
+# |  Build OCP with obstacle slack
+# ------------------------------------------------------------------------------
+def create_ocp_solver_with_obstacles(
+    Tf: float, N: int,
+    obstacles: List[Tuple[NDArray[np.floating], float]],
+    gate_pos:   NDArray[np.floating]
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Creates an acados Optimal Control Problem and Solver."""
-    ocp = AcadosOcp()
+    ocp             = AcadosOcp()
+    model           = export_quadrotor_ode_model()
+    ocp.model       = model
+    nx              = model.x.rows()
+    nu_base         = model.u.rows()
+    n_obs           = len(obstacles)
+    nu              = nu_base + n_obs
 
-    # set model
-    model = export_quadrotor_ode_model()
-    ocp.model = model
-
-    # Get Dimensions
-    nx = model.x.rows()
-    nu = model.u.rows()
-    ny = nx + nu
-    ny_e = nx
-
-    # Set dimensions
+    # horizon
     ocp.solver_options.N_horizon = N
+    ocp.solver_options.tf        = Tf
 
-    ## Set Cost
-    # For more Information regarding Cost Function Definition in Acados:
-    # https://github.com/acados/acados/blob/main/docs/problem_formulation/problem_formulation_ocp_mex.pdf
-    #
+    # cost
+    ny   = nx + nu
+    ny_e = nx
+    Q    = np.diag([10.0]*3 + [0.0]*3 + [0.0]*3)
+    Rw   = np.diag([5.0,5.0,5.0,8.0])
+    S    = np.eye(n_obs)*1000.0
+    W    = scipy.linalg.block_diag(Q, Rw, S)
+    W_e  = Q.copy()
 
-    # Cost Type
-    ocp.cost.cost_type = "LINEAR_LS"
-    ocp.cost.cost_type_e = "LINEAR_LS"
+    ocp.cost.cost_type   = 'LINEAR_LS'
+    ocp.cost.cost_type_e = 'LINEAR_LS'
+    ocp.cost.W   = W
+    ocp.cost.W_e = W_e
 
-    # Weights (we only give pos reference anyway)
-    Q = np.diag(
-        [
-            10.0,  # pos
-            10.0,  # pos
-            10.0,  # pos
-            0.0,  # vel
-            0.0,  # vel
-            0.0,  # vel
-            0.0,  # rpy
-            0.0,  # rpy
-            0.0,  # rpy
-        ]
-    )
+    # selectors
+    Vx = np.zeros((ny,nx)); Vx[:nx,:nx]=np.eye(nx)
+    Vu = np.zeros((ny,nu)); Vu[nx:nx+nu_base,:nu_base]=np.eye(nu_base)
+    Vs = np.zeros((ny,n_obs)); Vs[nx+nu_base:,:]=np.eye(n_obs)
+    ocp.cost.Vx, ocp.cost.Vu, ocp.cost.Vs = Vx, Vu, Vs
+    ocp.cost.Vx_e = np.vstack((np.eye(nx), np.zeros((ny_e-nx,nx))))
 
-    R = np.diag(
-        [
-            5.0,  # rpy
-            5.0,  # rpy
-            5.0,  # rpy
-            8.0,  # thrust
-        ]
-    )
+    # state bounds on rpy
+    ocp.constraints.idxbx = np.array([6,7,8])
+    ocp.constraints.lbx  = -np.pi/3*np.ones(3)
+    ocp.constraints.ubx  =  np.pi/3*np.ones(3)
 
-    Q_e = Q.copy()
-    ocp.cost.W = scipy.linalg.block_diag(Q, R)
-    ocp.cost.W_e = Q_e
+    # input bounds + slack
+    idxbu = np.arange(nu)
+    lbu   = np.concatenate(([-1.0]*3, [THRUST_MIN], [0.0]*n_obs))
+    ubu   = np.concatenate(([ 1.0]*3, [THRUST_MAX], [10.0]*n_obs))
+    ocp.constraints.idxbu, ocp.constraints.lbu, ocp.constraints.ubu = idxbu, lbu, ubu
 
-    Vx = np.zeros((ny, nx))
-    Vx[:3, :3] = np.eye(3)  # Only select position states
-    ocp.cost.Vx = Vx
+    # initial state placeholder
+    ocp.constraints.x0 = np.zeros(nx)
 
-    Vu = np.zeros((ny, nu))
-    Vu[nx : nx + nu, :] = np.eye(nu)  # Select all actions
-    ocp.cost.Vu = Vu
+    # nonlinear constraints: gate + obstacles
+    pos       = model.x[0:3]
+    gate_dist = norm_2(pos - MX(gate_pos))
+    nl_list   = []
+    lnlb      = []
+    lnub      = []
+    for i,(c,r) in enumerate(obstacles):
+        d_obs = norm_2(pos - MX(c))
+        slack = model.u[4+i]
+        nl_list.append(d_obs + slack)
+        lnlb.append(r)
+        lnub.append(1e6)
+    ocp.constraints.nl_constr_expr = vertcat(*nl_list)
+    ocp.constraints.lnlc           = np.array(lnlb)
+    ocp.constraints.unlc           = np.array(lnub)
 
-    Vx_e = np.zeros((ny_e, nx))
-    Vx_e[:3, :3] = np.eye(3)  # Only select position states
-    ocp.cost.Vx_e = Vx_e
+    # gate constraint
+    # Correct terminal constraint
+    ocp.constraints.constr_type_e = 'BGH'
+    ocp.constraints.lh_e = np.array([0.0])
+    ocp.constraints.uh_e = np.array([GATE_RADIUS])
+    ocp.constraints.h_e = gate_dist
 
-    # Set initial references (we will overwrite these later on to make the controller track the traj.)
-    ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
+    # solver opts
+    opts = ocp.solver_options
+    opts.qp_solver           = 'FULL_CONDENSING_HPIPM'
+    opts.hessian_approx      = 'GAUSS_NEWTON'
+    opts.integrator_type     = 'ERK'
+    opts.nlp_solver_type     = 'SQP'
+    opts.tol                 = 1e-5
+    opts.qp_solver_iter_max  = 1000
+    opts.nlp_solver_max_iter = 1000
 
-    # Set State Constraints (rpy < 60°)
-    ocp.constraints.lbx = np.array([-1.0, -1.0, -1.0])
-    ocp.constraints.ubx = np.array([1.0, 1.0, 1.0])
-    ocp.constraints.idxbx = np.array([6, 7, 8])
+    solver = AcadosOcpSolver(ocp, json_file='ocp.json', verbose=False)
+    solver.n_obs     = n_obs
+    solver.obstacles = obstacles
+    solver.gate_pos  = gate_pos
+    solver.gate_rad  = GATE_RADIUS
+    return solver, ocp
 
-    # Set Input Constraints (rpy < 60°)
-    ocp.constraints.lbu = np.array([-1.0, -1.0, -1.0, constants.THRUST_MIN * 4])
-    ocp.constraints.ubu = np.array([1.0, 1.0, 1.0, constants.THRUST_MAX * 4])
-    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
-
-    # We have to set x0 even though we will overwrite it later on.
-    ocp.constraints.x0 = np.zeros((nx))
-
-    # Solver Options
-    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"  # FULL_CONDENSING_QPOASES
-    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
-    ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP"  # SQP_RTI
-    ocp.solver_options.tol = 1e-5
-
-    ocp.solver_options.qp_solver_cond_N = N
-    ocp.solver_options.qp_solver_warm_start = 1
-
-    ocp.solver_options.qp_solver_iter_max = 20
-    ocp.solver_options.nlp_solver_max_iter = 50
-
-    # set prediction horizon
-    ocp.solver_options.tf = Tf
-
-    acados_ocp_solver = AcadosOcpSolver(
-        ocp, json_file="c_generated_code/lsy_example_mpc.json", verbose=verbose
-    )
-
-    return acados_ocp_solver, ocp
-
-
+# ------------------------------------------------------------------------------
+# |  Dynamic Attitude MPC Controller
+# ------------------------------------------------------------------------------
 class AttitudeMPC(Controller):
-    """Example of a MPC using the collective thrust and attitude interface."""
-
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
-        """Initialize the attitude controller.
-
-        Args:
-            obs: The initial observation of the environment's state. See the environment's
-                observation space for details.
-            info: Additional environment information from the reset.
-            config: The configuration of the environment.
-        """
+    """
+    Controller that tracks a minimum-jerk trajectory, avoids obstacles via slacks,
+    and replans dynamically when obstacles or gate updates.
+    """
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: ConfigDict):
         super().__init__(obs, info, config)
-        self._N = 30
-        self._dt = 1 / config.env.freq
-        self._T_HORIZON = self._N * self._dt
+        # MPC parameters
+        self._N    = 30
+        self._dt   = 1.0 / config.env.freq
+        self._T    = self._N * self._dt
+        
 
-        # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [1.0, 1.5, 0.05],
-                [0.8, 1.0, 0.2],
-                [0.55, -0.3, 0.5],
-                [0.2, -1.3, 0.65],
-                [1.1, -0.85, 1.1],
-                [0.2, 0.5, 0.65],
-                [0.0, 1.2, 0.525],
-                [0.0, 1.2, 1.1],
-                [-0.5, 0.0, 1.1],
-                [-0.5, -0.5, 1.1],
-            ]
+        # Extract gates & build waypoints
+        gates = config.env.track.gates
+        waypoints = np.array([gate.pos for gate in gates])
+        times     = np.linspace(0.0, self._T, len(waypoints))
+
+        self._gates = waypoints
+        self._current_gate_idx = 0
+        self._current_gate = self._gates[0]
+
+        # Extract obstacles & radii
+        obstacles_cfg = config.env.track.obstacles
+        obstacles = [ ( np.array(o.pos), OBSTACLE_RADIUS ) for o in obstacles_cfg ]
+
+        self._hover_thrust_cmd = (MASS * np.linalg.norm(GRAVITY_VEC) - SI_ACC[0]) / SI_ACC[1]
+        
+
+        # Trajectory generator
+        self.traj = MinimumJerkTrajectory(waypoints, times)
+
+        # Build solver
+        self._solver, self._ocp = create_ocp_solver_with_obstacles(
+            Tf = self._T,
+            N  = self._N,
+            obstacles=obstacles,
+            gate_pos = self._current_gate,
         )
 
-        des_completion_time = 8
-        ts = np.linspace(0, des_completion_time, np.shape(waypoints)[0])
-        cs_x = CubicSpline(ts, waypoints[:, 0])
-        cs_y = CubicSpline(ts, waypoints[:, 1])
-        cs_z = CubicSpline(ts, waypoints[:, 2])
-
-        ts = np.linspace(0, des_completion_time, int(config.env.freq * des_completion_time))
-        x_des = cs_x(ts)
-        y_des = cs_y(ts)
-        z_des = cs_z(ts)
-
-        x_des = np.concatenate((x_des, [x_des[-1]] * self._N))
-        y_des = np.concatenate((y_des, [y_des[-1]] * self._N))
-        z_des = np.concatenate((z_des, [z_des[-1]] * self._N))
-        self._waypoints_pos = np.stack((x_des, y_des, z_des)).T
-        self._waypoints_yaw = x_des * 0
-
-        self._acados_ocp_solver, self._ocp = create_ocp_solver(self._T_HORIZON, self._N)
+        # dims
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
         self._ny = self._nx + self._nu
-        self._ny_e = self._nx
-
         self._tick = 0
-        self._tick_max = len(x_des) - 1 - self._N
-        self._config = config
         self._finished = False
+        self._last_pos =np.zeros(3)
 
-    def compute_control(
-        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
-    ) -> NDArray[np.floating]:
-        """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
+    def update_obstacles(self, new_obs: List[Tuple[NDArray[np.floating], float]]):
+        self._solver, self._ocp = create_ocp_solver_with_obstacles(
+            Tf=self._T, N=self._N,
+            obstacles=new_obs, gate_pos=self._current_gate
+        )
 
-        Args:
-            obs: The current observation of the environment. See the environment's observation space
-                for details.
-            info: Optional additional information as a dictionary.
+    def update_gate(self, new_gate: NDArray[np.floating]):
+        remaining_gates = self._gates[self._current_gate_idx+1:]
+        if len(remaining_gates) > 0:
+            waypoints = np.vstack([self._last_pos, remaining_gates])
+            times     = np.linspace(0.0, self._T, len(waypoints))
+            self.traj = MinimumJerkTrajectory(waypoints, times)
 
-        Returns:
-            The collective thrust and orientation [t_des, r_des, p_des, y_des] as a numpy array.
-        """
-        i = min(self._tick, self._tick_max)
-        if self._tick >= self._tick_max:
-            self._finished = True
+        self._solver, self._ocp = create_ocp_solver_with_obstacles(
+            Tf=self._T, N=self._N,
+            obstacles=self._solver.obstacles, gate_pos=new_gate
+        )
 
-        # Setting initial state
-        obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
-        x0 = np.concatenate((obs["pos"], obs["vel"], obs["rpy"]))
-        self._acados_ocp_solver.set(0, "lbx", x0)
-        self._acados_ocp_solver.set(0, "ubx", x0)
+    def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None=None) -> NDArray[np.floating]:
 
-        # Setting reference
-        yref = np.zeros((self._N, self._ny))
-        yref[:, 0:3] = self._waypoints_pos[i + self._N]  # position
-        yref[:, 5] = self._waypoints_yaw[i + self._N]  # yaw
-        yref[:, 9] = constants.MASS * constants.GRAVITY  # hover thrust
+        self._last_pos = obs['pos'].copy()
+
+        #Update gate if needed
+        if info and info.get("gates_passed", 0) > self._current_gate_idx:
+            self._current_gate_idx = info["gates_passed"]
+            if self._current_gate_idx < len(self._gates):
+                self._current_gate = self._gates[self._current_gate_idx]
+                self.update_gate(self._current_gate)
+            else:
+                self._finished = True
+                return np.zeros(4)  # Return zero control if finished
+            
+        # state
+        obs['rpy'] = R.from_quat(obs['quat']).as_euler('xyz')
+        x0 = np.concatenate((obs['pos'], obs['vel'], obs['rpy']))
+        self._solver.set(0,'lbx',x0)
+        self._solver.set(0,'ubx',x0)
+
+        # build refs
         for j in range(self._N):
-            self._acados_ocp_solver.set(j, "yref", yref[j])
+            t_f = self._tick*self._dt + j*self._dt
+            pos_ref, _, _ = self.traj.evaluate(t_f)
+            yref = np.zeros(self._ny)
+            yref[0:3] = pos_ref
+            yref[8]   = 0.0                      # yaw reference
+            yref[12]  = self._hover_thrust_cmd  # thrust reference
+            self._solver.set(j,'yref',yref)
 
-        yref_e = np.zeros((self._ny_e))
-        yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
-        yref_e[5] = self._waypoints_yaw[i + self._N]  # yaw
-        self._acados_ocp_solver.set(self._N, "yref", yref_e)
+        # terminal
+        t_f = self._tick*self._dt + self._T
+        pos_ref, _, _ = self.traj.evaluate(t_f)
+        yref_e = np.zeros(self._nx)
+        yref_e[0:3] = pos_ref
+        self._solver.set(self._N,'yref',yref_e)
 
-        # Solving problem and getting first input
-        self._acados_ocp_solver.solve()
-        u0 = self._acados_ocp_solver.get(0, "u")
+        status = self._solver.solve()
+        if status != 0:
+            logger.warning(f"MPC solve failed {status}")
 
-        # WARNING: The following line is only for legacy reason!
-        # The Crazyflie uses the rpyt command format, the environment
-        # take trpy format. Remove this line as soon as the env
-        # also works with rpyt!
-        u0 = np.array([u0[3], *u0[:3]])
-
-        return u0
-
-    def step_callback(
-        self,
-        action: NDArray[np.floating],
-        obs: dict[str, NDArray[np.floating]],
-        reward: float,
-        terminated: bool,
-        truncated: bool,
-        info: dict,
-    ) -> bool:
-        """Increment the tick counter."""
+        u_opt = self._solver.get(0,'u')
         self._tick += 1
+        # return [thrust, r, p, y]
+        return np.array([u_opt[3], u_opt[0], u_opt[1], u_opt[2]])
 
+    def step_callback(self, *args, **kwargs) -> bool:
         return self._finished
 
-    def episode_callback(self):
-        """Reset the integral error."""
+    def episode_callback(self) -> float:
         self._tick = 0
+        self._finished = False
+
+        gates_passed = self._info.get("gates_passed", 0)
+        flight_time  = self._info.get("flight_time", 0.0)
+
+        logger.info(f"Gates passed: {gates_passed}")
+        logger.info(f"Flight time: {flight_time:.2f} seconds")
+
+        # Return something useful so Fire prints it
+        return flight_time
