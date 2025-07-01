@@ -7,6 +7,7 @@ from lsy_drone_racing.control import Controller
 from scipy.spatial.transform import Rotation
 from scipy.spatial.transform import RotationSpline
 
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -25,41 +26,36 @@ class MinSnapMPCController(Controller):
         self._Q_vel = 2
         self._R_acc = 0.1
         self._u_max = 8.0
-        print(f"DEBUG: MPC parameters set: horizon={self._horizon}, Q_pos={self._Q_pos}, "
-              f"Q_vel={self._Q_vel}, R_acc={self._R_acc}, u_max={self._u_max}")
         self._X0_param = None
         self._X_ref_param = None
         self._X_var = None
         self._U_var = None
-        print("DEBUG: MPC solver parameters initialized.")
         self._reference_trajectory = None
         self._trajectory_start_time = 0.0
         self._t_total = 0
         self._approach_distance = 1
         self._exit_distance = 0.5
-        print("DEBUG: Trajectory parameters initialized.")
         self._gates = self._get_gate_positions(config)
         print(f"DEBUG: Gates loaded: {len(self._gates)} gates found.")
         self._obstacles = self._get_obstacles(config)
         print(f"DEBUG: Obstacles loaded: {len(self._obstacles)} obstacles found.")
         self._waypoints = self._generate_waypoints()
-        print(f"DEBUG: Waypoints generated: {len(self._waypoints)} waypoints found.")
         print("DEBUG: waypoints:", self._waypoints)
         self._generate_reference_trajectory(obs)
         print("DEBUG: Reference trajectory generated with total time:", self._t_total)
+        
+        
 
     def _get_gate_positions(self, config: dict) -> list[dict]:
         track = config.env.track
         raw = getattr(track, 'gates', None)
         if raw is None and isinstance(track, dict):
             raw = track.get('gates', [])
-        print(f"DEBUG: found {len(raw) if raw else 0} raw gates in config")
         gates = []
         for gate in raw or []:
             pos = np.array(getattr(gate, 'pos', gate['pos']))
             rpy = np.array(getattr(gate, 'rpy', gate.get('rpy', [0,0,0])))
             gates.append({'pos': pos, 'rpy': rpy})
-        print(f"DEBUG: Loaded {len(gates)} gates → {gates}")
         return gates
 
     def _get_obstacles(self, config: dict) -> list[dict]:
@@ -67,7 +63,7 @@ class MinSnapMPCController(Controller):
         raw = getattr(track, 'obstacles', None)
         if raw is None and isinstance(track, dict):
             raw = track.get('obstacles', [])
-        print(f"DEBUG: found {len(raw) if raw else 0} raw obstacles in config")
+        #print(f"DEBUG: found {len(raw) if raw else 0} raw obstacles in config")
         obstacles = []
         for obs in raw or []:
             pos = np.array(getattr(obs, 'pos', obs['pos']))
@@ -76,7 +72,7 @@ class MinSnapMPCController(Controller):
                 'radius': getattr(obs, 'radius', obs.get('radius', 0.25)),
                 'height': getattr(obs, 'height', obs.get('height', 1.4))
             })
-        print(f"DEBUG: Loaded {len(obstacles)} obstacles → {obstacles}")
+        #print(f"DEBUG: Loaded {len(obstacles)} obstacles → {obstacles}")
         return obstacles
         
     def _generate_waypoints(self) -> list[dict]:
@@ -99,10 +95,10 @@ class MinSnapMPCController(Controller):
     def _calculate_trajectory_times(self,start_pos: np.ndarray,  waypoints: list, base_speed: float = 2.0) -> np.ndarray:
         if len(waypoints) < 2:
             return np.array([0.0])
-        print("DEBUG: Calculating trajectory times for waypoints.")
+        #print("DEBUG: Calculating trajectory times for waypoints.")
         times = [0.0]
         current_time = 0.0
-        min_time_increment = 3  # small nonzero duration
+        min_time_increment = 0.3  # small nonzero duration
         prev_pos = start_pos
         for wp in waypoints:
             curr_pos = wp['pos']
@@ -112,7 +108,7 @@ class MinSnapMPCController(Controller):
             current_time += segment_time
             times.append(current_time)
             prev_pos = curr_pos  
-        print(f"DEBUG: Trajectory times: {times}")
+        #print(f"DEBUG: Trajectory times: {times}")
         assert np.all(np.diff(times) > 0), f"Times not strictly increasing: {times}"
         return np.array(times)
 
@@ -121,16 +117,16 @@ class MinSnapMPCController(Controller):
         current_pos = obs["pos"]
         current_vel = obs.get ("vel", np.zeros(3))
         current_yaw = obs.get("rpy", np.zeros(3))[2]
-        print(f"DEBUG: Current position: {current_pos}, velocity: {current_vel}, yaw : {current_yaw}")
+        #print(f"DEBUG: Current position: {current_pos}, velocity: {current_vel}, yaw : {current_yaw}")
         times = self._calculate_trajectory_times(obs['pos'],self._waypoints, base_speed=2.0)
         self._t_total = times[-1]
-        print(f"DEBUG: Total trajectory time calculated: {self._t_total:.2f} seconds")
+        #print(f"DEBUG: Total trajectory time calculated: {self._t_total:.2f} seconds")
         refs = []
         refs.append(ms.Waypoint(position=current_pos, time=0.0,
                                 velocity=current_vel, acceleration=np.zeros(3)))
         for wp, time in zip(self._waypoints, times[1:]):
             refs.append(ms.Waypoint(position=wp['pos'], time=time))
-        print("DEBUG: Waypoints for trajectory generation:", refs)
+        #print("DEBUG: Waypoints for trajectory generation:", refs)
 
         try:
             polys = ms.generate_trajectory(refs, degree=7, idx_minimized_orders=(4,),
@@ -142,7 +138,7 @@ class MinSnapMPCController(Controller):
 
         t_eval = np.linspace(0, self._t_total, int(self._t_total * self._freq) + 1)
         pva = ms.compute_trajectory_derivatives(polys, t_eval, 3)
-        print(f"DEBUG: Computed trajectory derivatives at {len(t_eval)} time points.")
+        #print(f"DEBUG: Computed trajectory derivatives at {len(t_eval)} time points.")
 
         yaw_refs = [current_yaw]
         yaw_refs += [wp['rpy'][2] for wp in self._waypoints]
@@ -152,9 +148,9 @@ class MinSnapMPCController(Controller):
 
         self._reference_trajectory = {
             't': t_eval,
-            'pos': pva[0],
-            'vel': pva[1],
-            'acc': pva[2],
+            'pos': pva[0].T,
+            'vel': pva[1].T,
+            'acc': pva[2].T,
             'yaw': yaw_traj,
         }
 
@@ -225,24 +221,28 @@ class MinSnapMPCController(Controller):
     def _interpolate_reference(self, current_time: float) -> NDArray[np.floating]:
         if self._reference_trajectory is None:
             return np.zeros((6, self._horizon + 1))
-        print(f"DEBUG: Interpolating reference trajectory at time {current_time:.3f}s")
+        
         current_time = min(current_time, self._t_total)
         t_horizon = np.linspace(current_time, 
                                current_time + self._horizon * self.dt, 
                                self._horizon + 1)
         t_horizon = np.clip(t_horizon, 0, self._t_total)
         t_ref = self._reference_trajectory['t']
+        
         ref_pos = np.zeros((3, len(t_horizon)))
         ref_vel = np.zeros((3, len(t_horizon)))
+        
+
         for i in range(3):
             ref_pos[i, :] = np.interp(t_horizon, t_ref, self._reference_trajectory['pos'][i, :])
             ref_vel[i, :] = np.interp(t_horizon, t_ref, self._reference_trajectory['vel'][i, :])
+        
         return np.vstack([ref_pos, ref_vel])
 
     def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
         if self._mpc_solver is None:
             self._setup_mpc()
-        print("DEBUG: MPC solver initialized.")
+        
         current_time = min(self._tick / self._freq, self._t_total)
         if current_time >= self._t_total - 0.1:
             self._finished = True
@@ -254,6 +254,7 @@ class MinSnapMPCController(Controller):
         state_vec = np.clip(state_vec, -100.0, 100.0)
         assert not np.isnan(state_vec).any(), "Initial state has NaNs"
         ref_traj = self._interpolate_reference(current_time)
+        #print(f"DEBUG: Reference trajectory interpolated at time {current_time:.3f}s, shape: {ref_traj.shape}")
         assert not np.isnan(ref_traj).any(), "Reference trajectory has NaNs"
         try:
             self._mpc_solver.set_value(self._X0_param, state_vec)
