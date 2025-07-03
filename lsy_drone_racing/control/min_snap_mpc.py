@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import casadi as ca
 import minsnap_trajectories as ms
+import lsy_drone_racing.utils.trajectory as trajectory
 from lsy_drone_racing.control import Controller
 from scipy.spatial.transform import Rotation
 from scipy.spatial.transform import RotationSpline
@@ -89,28 +90,6 @@ class MinSnapMPCController(Controller):
                                })
             
         return way_points
-    
-    
-
-    def _calculate_trajectory_times(self,start_pos: np.ndarray,  waypoints: list, base_speed: float = 2.0) -> np.ndarray:
-        if len(waypoints) < 2:
-            return np.array([0.0])
-        #print("DEBUG: Calculating trajectory times for waypoints.")
-        times = [0.0]
-        current_time = 0.0
-        min_time_increment = 0.3  # small nonzero duration
-        prev_pos = start_pos
-        for wp in waypoints:
-            curr_pos = wp['pos']
-            distance = np.linalg.norm(curr_pos - prev_pos)
-            segment_time = distance / base_speed
-            segment_time = max(segment_time, min_time_increment)
-            current_time += segment_time
-            times.append(current_time)
-            prev_pos = curr_pos  
-        #print(f"DEBUG: Trajectory times: {times}")
-        assert np.all(np.diff(times) > 0), f"Times not strictly increasing: {times}"
-        return np.array(times)
 
 
     def _generate_reference_trajectory(self, obs: dict[str, NDArray[np.floating]]) -> None:
@@ -118,7 +97,7 @@ class MinSnapMPCController(Controller):
         current_vel = obs.get ("vel", np.zeros(3))
         current_yaw = obs.get("rpy", np.zeros(3))[2]
         #print(f"DEBUG: Current position: {current_pos}, velocity: {current_vel}, yaw : {current_yaw}")
-        times = self._calculate_trajectory_times(obs['pos'],self._waypoints, base_speed=2.0)
+        times = [0,2,4,6.7,9]
         self._t_total = times[-1]
         #print(f"DEBUG: Total trajectory time calculated: {self._t_total:.2f} seconds")
         refs = []
@@ -136,7 +115,7 @@ class MinSnapMPCController(Controller):
             print(f"DEBUG: Trajectory generation failed: {e}")
             raise
 
-        t_eval = np.linspace(0, self._t_total, int(self._t_total * self._freq) + 1)
+        t_eval = np.linspace(0, self._t_total, int(self._t_total * 20) + 1)
         pva = ms.compute_trajectory_derivatives(polys, t_eval, 3)
         #print(f"DEBUG: Computed trajectory derivatives at {len(t_eval)} time points.")
 
@@ -151,7 +130,7 @@ class MinSnapMPCController(Controller):
             'pos': pva[0].T,
             'vel': pva[1].T,
             'acc': pva[2].T,
-            'yaw': yaw_traj,
+            #'yaw': yaw_traj,
         }
 
     def _setup_mpc(self) -> None:
@@ -264,12 +243,10 @@ class MinSnapMPCController(Controller):
             desired_pos = ref_traj[0:3, 0]
             desired_vel = ref_traj[3:6, 0]
 
-            yaw_cmd = np.interp(current_time, self._reference_trajectory['t'], self._reference_trajectory['yaw'])
-
             
-            desired_pos[2] =  current_pos[2]  # Maintain current altitude
+            
 
-            return np.concatenate((desired_pos, desired_vel, u_opt,[yaw_cmd,0.0,0.0,0.0]), dtype=np.float32)
+            return np.concatenate((desired_pos, desired_vel, u_opt,[0,0.0,0.0,0.0]), dtype=np.float32)
 
         except Exception as e:
             print(f"MPC solver failed at t={current_time:.3f}: {e}")
@@ -323,22 +300,3 @@ class MinSnapMPCController(Controller):
             'finished': self._finished
         }
 
-def generate_min_snap_trajectory_standalone(gate_points, times, freq=50, start_vel=None, start_acc=None, end_vel=None, end_acc=None):
-    if len(gate_points) != len(times):
-        raise ValueError("Number of gate points must match number of times.")
-    start_vel = start_vel or [0, 0, 0]
-    start_acc = start_acc or [0, 0, 0]
-    end_vel = end_vel or [0, 0, 0]
-    end_acc = end_acc or [0, 0, 0]
-    refs = []
-    for i, (point, time) in enumerate(zip(gate_points, times)):
-        if i == 0:
-            refs.append(ms.Waypoint(time=time, position=point, velocity=start_vel, acceleration=start_acc))
-        elif i == len(gate_points) - 1:
-            refs.append(ms.Waypoint(time=time, position=point, velocity=end_vel, acceleration=end_acc))
-        else:
-            refs.append(ms.Waypoint(time=time, position=point))
-    polys = ms.generate_trajectory(refs, degree=7, idx_minimized_orders=(4,), num_continuous_orders=3, algorithm="closed-form")
-    t = np.linspace(times[0], times[-1], int(freq * (times[-1] - times[0])))
-    pva = ms.compute_trajectory_derivatives(polys, t, 3)
-    return t, pva[0, ...].T, pva[1, ...].T, pva[2, ...].T 
