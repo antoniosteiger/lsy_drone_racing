@@ -11,3 +11,4 @@ saves
 plots/
 c_generated_code/
 experiments/
+.DS_store
