@@ -7,6 +7,7 @@ import lsy_drone_racing.utils.minsnap as minsnap
 from lsy_drone_racing.control import Controller
 import lsy_drone_racing.utils.trajectory as trajectory
 import traceback
+#import lsy_drone_racing.utils.path_planner as PathPlanner
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -113,7 +114,7 @@ class MinSnapMPCController(Controller):
 
         try:
             print("DEBUG: Generating reference trajectory...")
-            self._generate_reference_trajectory(obs)
+            self._generate_reference_trajectory({'pos':np.array([1.0, 1.5, 0.07])})
             print("DEBUG: Reference trajectory generated successfully")
         except Exception as e:
             print(f"DEBUG ERROR: Failed to generate reference trajectory: {e}")
@@ -541,6 +542,11 @@ class MinSnapMPCController(Controller):
 
     def compute_control(self, obs, info=None):
         print(f"\nDEBUG: ===== Computing control at tick {self._tick} =====")
+
+        # RERUN THE PATH PLANNER (PSEUDOCODE):
+        # if is_obs_different(gates_pos): # from observation
+        #       traj = pp.plan(gates_pos, gates_rpy, obstacles_pos, ...)
+        #       trajectory.trajectory = traj
         
         if self._mpc_solver is None:
             print("DEBUG: MPC solver not initialized, setting up...")
