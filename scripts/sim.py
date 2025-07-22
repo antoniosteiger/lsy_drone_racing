@@ -53,7 +53,7 @@ def simulate(
     """
 
     # Settings
-    trajectory_color = np.array([1.0, 0, 0, 1])
+    trajectory_color = np.array([1.0, 1.0, 0, 1])
 
     if trajectory_visualization:
         print("SIM: Trajectory visualization enabled.")
@@ -161,7 +161,7 @@ def draw_trajectory(env, trajectory, color):
     # Draw the trajectory line
     trajectory = trajectory[:, 0:3]  # Only take the x, y, z coordinates
     trajectory = decimate(trajectory, 500)
-    draw_line(env, trajectory, color)
+    draw_line(env, trajectory, color, 10.0, 10.0)
 
 
 if __name__ == "__main__":

@@ -4,10 +4,10 @@ from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
 POINTS_PER_SECTION = 100
-TOTAL_POINTS = 400
 OBSTACLE_SIZE = [0.10, 0.10, 2.0]
 GATE_SIZE = [0.50, 0.03, 0.50]
-CLEARANCE = 0.25
+CLEARANCE = 0.22
+WAYPOINT_SPEED = 1.1
 
 class PathPlanner:
     def __init__(self, pos, waypoints, tangents, obstacles_pos):
@@ -25,14 +25,14 @@ class PathPlanner:
     def plan(self, pos, waypoints, tangents, obstacles_pos):
         MAX_ITERATIONS = 1
         STARTING_TANGENT = [0, 0, 0]
-        END_POS = [-0.5, -0.3, 1.11]
+        END_POS = [-0.5, -0.8, 1.11]
         END_TANGENT = [0, 0, 3.14]
 
         self.waypoints = np.vstack([self.initial_pos, waypoints, END_POS])
         self.tangents = np.vstack([STARTING_TANGENT, tangents, END_TANGENT])
         self.obstacles = self.make_obstacles(self.waypoints, self.tangents, obstacles_pos, GATE_SIZE, OBSTACLE_SIZE)
         
-        tangents = self.rpy_to_tangents(self.tangents, 1.8)
+        tangents = self.rpy_to_tangents(self.tangents, WAYPOINT_SPEED)
         path = self.make_path(self.waypoints, tangents)
         
         # Check for collisions and replan MAX_ITERATIONS+1 times
@@ -40,6 +40,7 @@ class PathPlanner:
             collision_indices, collision_obstacles = self.check_collisions(path, self.obstacles)
             if i == 0:
                 self.collision_indices = collision_indices # update for plotting
+                print(collision_indices)
             if len(self.collision_indices) > 0:
                 self.detour_waypoints, detour_tangents = self.detour(path, self.waypoints, tangents, collision_indices, collision_obstacles)
                 # print("Detour_Waypoints:\n", self.detour_waypoints)
@@ -64,17 +65,17 @@ class PathPlanner:
             splines = [CubicHermiteSpline(p, waypoints[:, i], tangents[:, i]) for i in range(3)]
         else:
             splines = [CubicSpline(p, waypoints[:, i]) for i in range(3)]
-        p_fine = np.linspace(p[0], p[-1], TOTAL_POINTS)
+        p_fine = np.linspace(p[0], p[-1], (len(waypoints)-1) * POINTS_PER_SECTION)
         path = np.stack([spline(p_fine) for spline in splines], axis=1)
 
         self.path = path
         return path
     
     
-    def check_collisions(self, path, obstacles, margin=0.04):
+    def check_collisions(self, path, obstacles, margin=0.08):
         all_collision_indices = []
         collision_obstacles = {}
-        RESOLUTION = 25
+        RESOLUTION = 30
     
         for obstacle in obstacles:
             center = np.array(obstacle['center'])
@@ -125,7 +126,7 @@ class PathPlanner:
         
         # Edge detection: keep only first index from consecutive sequences
         if not filtered_indices:
-            return []
+            return [], []
         
         edge_indices = [filtered_indices[0]]  # Always keep the first index
         last_added = filtered_indices[0]
@@ -137,6 +138,8 @@ class PathPlanner:
         
         # update for plotting
         self.collision_indices = edge_indices
+        arr1 = np.array(edge_indices, dtype=np.int64)
+        print(f"Filtered Indices: {arr1}")
         return edge_indices, collision_obstacles
     
     def detour(self, path, waypoints, tangents, collision_indices, collision_obstacles):
@@ -155,15 +158,16 @@ class PathPlanner:
             
             # calculate detour point:
             heading = waypoints[current_section+1] - center
-            # heading[2] = 0
+            heading[2] = 0
             heading = heading / np.linalg.norm(heading)
 
             collision = path[i] - center
             # collision[2] = 0
             collision = collision / np.linalg.norm(collision)
 
-            detour_vector = (collision + heading) / np.linalg.norm(collision + heading)
-
+            detour_vector = (collision + heading)
+            detour_xy_norm = np.linalg.norm(detour_vector[:2])
+            detour_vector = detour_vector / detour_xy_norm
             detour_point = path[i] + CLEARANCE * detour_vector
 
 
@@ -236,19 +240,22 @@ class PathPlanner:
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
+        ax.view_init(elev=90, azim=-90)
         ax.plot(*self.path.T)
         
         # plot waypoints
-        # ax.scatter(*self.waypoints.T, color='green')
+        ax.scatter(*self.waypoints.T, color='green')
         
         # plot collision points
-        # if len(self.collision_indices) > 0:
-        #     collision_points = self.path[self.collision_indices]
-        #     ax.scatter(*collision_points.T, color='red')
+        if len(self.collision_indices) > 0:
+            collision_points = self.path[self.collision_indices]
+            # print(collision_points)
+            ax.scatter(*collision_points.T, color='red')
 
         # plot reroute points
         if len(self.detour_waypoints) > 0:
             ax.scatter(*self.detour_waypoints.T, color='blue')
+            print(self.detour_waypoints)
 
         if self.obstacles is not None:
             for obstacle in self.obstacles:
