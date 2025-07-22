@@ -1,748 +1,583 @@
-from __future__ import annotations
-from typing import TYPE_CHECKING
-import numpy as np
-import casadi as ca
-import minsnap_trajectories as ms
-import lsy_drone_racing.utils.minsnap as minsnap
 from lsy_drone_racing.control import Controller
+import numpy as np
+from numpy.typing import NDArray
+import lsy_drone_racing.utils.minsnap as minsnap
 import lsy_drone_racing.utils.trajectory as trajectory
-import traceback
+from scipy.spatial.transform import Rotation as R
+import minsnap_trajectories as ms
+import casadi as ca
+from casadi import DM
 
-if TYPE_CHECKING:
-    from numpy.typing import NDArray
-
-class MinSnapMPCController(Controller):
-    def __init__(self, obs: dict[str, 'NDArray[np.floating]'], info: dict, config: dict):
-        print("=" * 50)
-        print("DEBUG: Initializing MinSnapMPCController")
-        print(f"DEBUG: obs keys: {list(obs.keys())}")
-        print(f"DEBUG: obs shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in obs.items()]}")
-        print(f"DEBUG: info: {info}")
-        print(f"DEBUG: config type: {type(config)}")
-        
-        try:
-            super().__init__(obs, info, config)
-            print("DEBUG: Super init successful")
-        except Exception as e:
-            print(f"DEBUG ERROR: Super init failed: {e}")
-            traceback.print_exc()
-            raise
-        
+class MinSnapTracker(Controller):
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        super().__init__(obs, info, config)
+        print("OBSERVATION KEYS at init:", list(obs.keys()))
         self._tick = 0
         self._finished = False
+
+        # Settings
+        self._t_total = 9.0
+        self._freq = config.env.freq
+        self._interpolation_factor = 3
+        self.dt = 1 / self._freq
+        self.horizon = 15
+        self.mass = 0.027
+
+        # MPC parameters - TRAJECTORY FOLLOWING PRIORITIZED
+        self.Q_pos = 100      # High trajectory tracking weight
+        self.Q_vel = 50       # High velocity tracking weight
+        self.R_acc = 1        # Control effort
+        self.U_max = 15
+        self.vel_max = 5
+
+        # Gate navigation parameters
+        self.gate_approach_distance = 1.0   # Start considering gate orientation at this distance
+        self.gate_passage_offset = 0.3      # How far ahead/behind gate center to aim for
+        self.gate_alignment_penalty = 2000  # Strong penalty for not aligning with gate orientation
+        self.gate_opening_radius = 0.4      # Safe passage radius
         
-        try:
-            self._freq = config.env.freq
-            print(f"DEBUG: Frequency: {self._freq}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Cannot get frequency from config: {e}")
-            print(f"DEBUG: Config structure: {dir(config)}")
-            if hasattr(config, 'env'):
-                print(f"DEBUG: Config.env structure: {dir(config.env)}")
-            self._freq = 50  # Default fallback
-            print(f"DEBUG: Using fallback frequency: {self._freq}")
+        # Obstacle avoidance - ONLY for obstacles in trajectory path
+        self.obstacle_penalty = 2000
+        self.obs_radius = 0.25
+        self.safe_distance = 0.2
+        self.trajectory_look_ahead = 8      # Look further ahead on trajectory
+        self.trajectory_width = 0.3         # Consider obstacles within this distance of trajectory path
         
-        self.dt = 1.0 / self._freq
-        self._horizon = int(1.2 / self.dt)  # ~1.2s horizon for speed
-        print(f"DEBUG: dt: {self.dt}, horizon: {self._horizon}")
-
-        # Base weights
-        self._Q_pos = 50
-        self._Q_vel = 15
-        self._Q_gate = 50
-        self._R_acc = 10
-        self._R_acc_ref = 50
-        self._u_max = 8.0
-        print(f"DEBUG: Weights initialized - Q_pos: {self._Q_pos}, Q_vel: {self._Q_vel}, Q_gate: {self._Q_gate}")
-
-        # Sensing limits
-        self._max_obs = 4
-        self._max_gates = 4
-        print(f"DEBUG: Max obstacles: {self._max_obs}, Max gates: {self._max_gates}")
-
-        # MPC handles
-        self._mpc_solver     = None
-        self._X0_param       = None
-        self._X_ref_param    = None
-        self._obs_pos_param  = None
-        self._obs_rad_param  = None
-        self._gate_pos_param = None
-        self._gate_wt_param  = None
-        self._U_ref_param    = None
-        self._Qp_param       = None
-        self._Qv_param       = None
-        self._Qg_param       = None
-        print("DEBUG: MPC handles initialized to None")
-
-        # Reference trajectory
-        self._reference_trajectory = None
-        self._t_total = 0.0
-
-        # Gate timing from make_refs
-        self._gate_times = [0.0, 2.0, 4.0, 6.7, 9.0]
-        print(f"DEBUG: Gate times: {self._gate_times}")
-
-        # Gate progression
-        self._current_gate_index = 0
-        self._gate_completion_threshold = 0.8
-        self._gate_completion_buffer = 3
-        self._completion_counter = 0
-        self._use_time_based_gates = True
-        print(f"DEBUG: Gate progression initialized - current index: {self._current_gate_index}")
-
-        # Static placeholders
-        try:
-            self._gates = self._get_gate_positions(config)
-            print(f"DEBUG: Gates extracted: {len(self._gates)} gates")
-            for i, gate in enumerate(self._gates):
-                print(f"DEBUG: Gate {i}: {gate}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to get gate positions: {e}")
-            traceback.print_exc()
-            self._gates = []
+        # Store initial conditions
+        self.current_gates_pos = np.copy(obs["gates_pos"])
+        self.original_gates_pos = np.copy(obs["gates_pos"])
+        self.initial_pos = np.copy(obs["pos"])
+        self.intial_vel = np.zeros(3, dtype=np.float32)
+        
+        # Use the correct key for gate quaternions
+        if "gates_quat" in obs:
+            self.gate_quats = obs["gates_quat"]
+        elif "gates_quant" in obs:  # Typo in your code?
+            self.gate_quats = obs["gates_quant"]
+        else:
+            print("WARNING: No gate quaternions found, using default orientations")
+            # Default to gates facing along y-axis
+            self.gate_quats = np.array([[0, 0, 0, 1]] * len(obs["gates_pos"]))
             
-        try:
-            self._obstacles = self._get_obstacles(config)
-            print(f"DEBUG: Obstacles extracted: {len(self._obstacles)} obstacles")
-            for i, obs in enumerate(self._obstacles):
-                print(f"DEBUG: Obstacle {i}: {obs}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to get obstacles: {e}")
-            traceback.print_exc()
-            self._obstacles = []
+        self.obstacles_pos = np.copy(obs["obstacles_pos"])
 
-        try:
-            print("DEBUG: Generating reference trajectory...")
-            self._generate_reference_trajectory(obs)
-            print("DEBUG: Reference trajectory generated successfully")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to generate reference trajectory: {e}")
-            traceback.print_exc()
-            raise
-
-        print("DEBUG: MinSnapMPCController initialization complete")
-        print("=" * 50)
-
-    def _get_gate_positions(self, config):
-        print("DEBUG: Getting gate positions")
-        print(f"DEBUG: Config type: {type(config)}")
-        print(f"DEBUG: Config attributes: {dir(config)}")
+        # Control mode flags
+        self.use_mpc = False
+        self.mpc_reason = ""
         
-        try:
-            raw = getattr(config.env.track, "gates", None)
-            print(f"DEBUG: Raw gates from config.env.track.gates: {raw}")
-        except Exception as e:
-            print(f"DEBUG: Cannot access config.env.track.gates: {e}")
-            raw = None
-            
-        if raw is None:
-            try:
-                if isinstance(config.env.track, dict):
-                    raw = config.env.track.get("gates", [])
-                    print(f"DEBUG: Raw gates from dict access: {raw}")
-                else:
-                    print(f"DEBUG: config.env.track is not a dict, type: {type(config.env.track)}")
-                    raw = []
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed dict access: {e}")
-                raw = []
+        # Generate trajectory with gate orientations
+        print("MINSNAP: Generating trajectory with gate orientations...")
+        trajectory.trajectory = minsnap.generate_trajectory(self.make_refs(), self._t_total)
+        print("MINSNAP: Trajectory generated")
+
+        # interpolate trajectory to regulate speed
+        trajectory.trajectory = interpolate_trajectory_linear(trajectory.trajectory, self._interpolation_factor)
+        print("MINSNAP: Trajectory interpolated")
+
+        self.setup_mpc()
+        print("MPC: Solver setup complete")
+    
+    def setup_mpc(self):
+        """Setup MPC with proper gate orientation handling"""
+        print("MPC: Setting up trajectory-first solver with gate orientation...")
+        opti = ca.Opti()
+        nx, nu, N = 6, 3, self.horizon
+        g = 9.81
         
-        if not raw:
-            print("DEBUG WARNING: No gates found, using empty list")
-            return []
+        # Decision variables
+        X = opti.variable(nx, N + 1)
+        U = opti.variable(nu, N)
+        
+        # Parameters
+        X_ref = opti.parameter(nx, N + 1)
+        U_ref = opti.parameter(nu, N)
+        X0 = opti.parameter(nx)
+        obstacles_param = opti.parameter(3, len(self.obstacles_pos))
+        target_gate_pos = opti.parameter(3)
+        gate_through_point = opti.parameter(3)  # Point to aim for when passing through gate
+        
+        # Mode flags
+        gate_navigation_mode = opti.parameter(1)  # When approaching/passing through gate
+        obstacle_avoidance_mode = opti.parameter(1)  # Only for trajectory-blocking obstacles
+        blocking_obstacles = opti.parameter(len(self.obstacles_pos))  # Which obstacles block the path
+        
+        # Initialize parameters
+        opti.set_value(X_ref, np.zeros((nx, N+1)))
+        opti.set_value(U_ref, np.zeros((nu, N)))
+        opti.set_value(X0, np.zeros(nx))
+        opti.set_value(obstacles_param, self.obstacles_pos.T)
+        opti.set_value(target_gate_pos, np.zeros(3))
+        opti.set_value(gate_through_point, np.zeros(3))
+        opti.set_value(gate_navigation_mode, 0)
+        opti.set_value(obstacle_avoidance_mode, 0)
+        opti.set_value(blocking_obstacles, np.zeros(len(self.obstacles_pos)))
+        
+        dt = self.dt
+        
+        # COST FUNCTION - TRAJECTORY FOLLOWING IS PRIMARY
+        cost = 0
+        for k in range(N):
+            state_error = X[:, k] - X_ref[:, k]
+            pos_error = state_error[0:3]
+            vel_error = state_error[3:6]
+            control_error = U[:, k] - U_ref[:, k]
             
-        gates = []
-        for i, g in enumerate(raw):
-            try:
-                if hasattr(g, 'pos'):
-                    pos = np.array(g.pos)
-                    print(f"DEBUG: Gate {i} position from attribute: {pos}")
-                elif isinstance(g, dict) and 'pos' in g:
-                    pos = np.array(g['pos'])
-                    print(f"DEBUG: Gate {i} position from dict: {pos}")
-                else:
-                    print(f"DEBUG ERROR: Gate {i} has no position data: {g}")
-                    continue
-                gates.append(pos)
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed to process gate {i}: {e}")
-                continue
+            # PRIMARY: Trajectory following (always high priority)
+            cost += self.Q_pos * ca.sumsqr(pos_error)
+            cost += self.Q_vel * ca.sumsqr(vel_error)
+            cost += self.R_acc * ca.sumsqr(control_error)
+            
+            # SECONDARY: Obstacle avoidance (only for trajectory-blocking obstacles)
+            for i in range(len(self.obstacles_pos)):
+                obstacle_pos = obstacles_param[:, i]
+                dist_to_obstacle = ca.norm_2(X[0:3, k] - obstacle_pos)
+                min_safe_dist = self.obs_radius + self.safe_distance
                 
-        print(f"DEBUG: Successfully extracted {len(gates)} gates")
-        return gates
-
-    def _get_obstacles(self, config):
-        print("DEBUG: Getting obstacles")
-        
-        try:
-            raw = getattr(config.env.track, "obstacles", None)
-            print(f"DEBUG: Raw obstacles from config.env.track.obstacles: {raw}")
-        except Exception as e:
-            print(f"DEBUG: Cannot access config.env.track.obstacles: {e}")
-            raw = None
+                # Only avoid obstacles that are marked as blocking the trajectory
+                is_blocking = blocking_obstacles[i]
+                obstacle_violation = ca.fmax(min_safe_dist - dist_to_obstacle, 0)
+                obstacle_cost = obstacle_avoidance_mode * is_blocking * self.obstacle_penalty * obstacle_violation**2
+                cost += obstacle_cost
             
-        if raw is None:
-            try:
-                if isinstance(config.env.track, dict):
-                    raw = config.env.track.get("obstacles", [])
-                    print(f"DEBUG: Raw obstacles from dict access: {raw}")
-                else:
-                    raw = []
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed dict access: {e}")
-                raw = []
-        
-        if not raw:
-            print("DEBUG: No obstacles found, using empty list")
-            return []
-            
-        obstacles = []
-        for i, o in enumerate(raw):
-            try:
-                if hasattr(o, 'pos'):
-                    pos = np.array(o.pos)
-                    radius = getattr(o, 'radius', 0.25)
-                elif isinstance(o, dict):
-                    pos = np.array(o['pos'])
-                    radius = o.get('radius', 0.25)
-                else:
-                    print(f"DEBUG ERROR: Obstacle {i} has invalid format: {o}")
-                    continue
-                    
-                obstacle = {"pos": pos, "radius": radius}
-                obstacles.append(obstacle)
-                print(f"DEBUG: Obstacle {i}: pos={pos}, radius={radius}")
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed to process obstacle {i}: {e}")
-                continue
-                
-        print(f"DEBUG: Successfully extracted {len(obstacles)} obstacles")
-        return obstacles
+            # TERTIARY: Gate navigation (aim for the correct point through the gate)
+            if k < N-2:  # Only apply to earlier horizon steps
+                # Instead of aligning to gate center, aim for the through-point
+                gate_targeting_error = X[0:3, k] - gate_through_point
+                gate_cost = gate_navigation_mode * self.gate_alignment_penalty * ca.sumsqr(gate_targeting_error)
+                cost += gate_cost
 
-    def make_refs(self, obs):
+        # Terminal cost (always favor reaching trajectory endpoints)
+        terminal_error = X[:, N] - X_ref[:, N]
+        cost += 2.0 * self.Q_pos * ca.sumsqr(terminal_error[0:3])
+        cost += 2.0 * self.Q_vel * ca.sumsqr(terminal_error[3:6])
+        
+        opti.minimize(cost)
+
+        # Dynamics constraints
+        for k in range(N):
+            a_total = U[:, k] + ca.DM([0, 0, g])
+            
+            pos_next = X[0:3, k] + dt * X[3:6, k] + 0.5 * dt**2 * a_total
+            vel_next = X[3:6, k] + dt * a_total
+
+            opti.subject_to(X[0:3, k + 1] == pos_next)
+            opti.subject_to(X[3:6, k + 1] == vel_next)
+            
+            # Input constraints
+            for i in range(nu):
+                opti.subject_to(U[i, k] >= -self.U_max)
+                opti.subject_to(U[i, k] <= self.U_max)
+            
+            # Velocity constraints
+            for i in range(3):
+                opti.subject_to(X[3+i, k] >= -self.vel_max)
+                opti.subject_to(X[3+i, k] <= self.vel_max)
+            
+            # Thrust constraints
+            opti.subject_to(U[2, k] >= -g-5)
+            opti.subject_to(U[2, k] <= 15)
+
+        # Initial condition constraint
+        opti.subject_to(X[:, 0] == X0)
+        
+        # Solver options
+        opts = {
+            "ipopt.print_level": 0,
+            "print_time": False,
+            "ipopt.max_iter": 150,
+            "ipopt.tol": 1e-4,
+            "ipopt.acceptable_tol": 1e-3,
+            "ipopt.warm_start_init_point": "yes"
+        }
+        opti.solver("ipopt", opts)
+
+        # Store solver and variables
+        self._mpc_solver = opti
+        self.X_var = X
+        self.U_var = U
+        self.X_ref_param = X_ref
+        self.U_ref_param = U_ref
+        self._X0_param = X0
+        self._obstacles_param = obstacles_param
+        self._target_gate_pos_param = target_gate_pos
+        self._gate_through_point_param = gate_through_point
+        self._gate_navigation_mode_param = gate_navigation_mode
+        self._obstacle_avoidance_mode_param = obstacle_avoidance_mode
+        self._blocking_obstacles_param = blocking_obstacles
+        
+        print("MPC: Gate-aware solver setup complete")
+
+    def get_gate_frame_vectors(self, gate_quat):
+        """Get gate normal and tangent vectors from quaternion"""
+        # Handle different quaternion formats (xyzw vs wxyz)
+        if len(gate_quat) == 4:
+            # Assume xyzw format, convert to scipy format
+            rotation = R.from_quat(gate_quat)  # scipy expects [x, y, z, w]
+        else:
+            raise ValueError(f"Invalid quaternion format: {gate_quat}")
+        
+        # Gate frame vectors - these might need adjustment based on your coordinate system
+        # Try different orientations if the current one doesn't work
+        local_normal = np.array([0, 1, 0])    # Direction to pass through gate (along y-axis)
+        local_tangent1 = np.array([1, 0, 0])  # Gate width direction (x-axis)
+        local_tangent2 = np.array([0, 0, 1])  # Gate height direction (z-axis)
+        
+        # Transform to world coordinates
+        world_normal = rotation.apply(local_normal)
+        world_tangent1 = rotation.apply(local_tangent1)
+        world_tangent2 = rotation.apply(local_tangent2)
+        
+        return world_normal, world_tangent1, world_tangent2
+
+    def get_gate_through_point(self, gate_pos, gate_quat, approach_from_behind=True):
+        """Calculate the point to aim for when passing through the gate"""
+        gate_normal, _, _ = self.get_gate_frame_vectors(gate_quat)
+        
+        # Aim for a point slightly ahead of the gate center in the direction of passage
+        offset_distance = self.gate_passage_offset
+        if approach_from_behind:
+            # Aim for a point beyond the gate
+            through_point = gate_pos + offset_distance * gate_normal
+        else:
+            # Aim for a point before the gate
+            through_point = gate_pos - offset_distance * gate_normal
+            
+        return through_point
+
+    def check_gate_navigation_need(self, obs) -> tuple[bool, str, int, np.ndarray]:
+        """Check if gate navigation assistance is needed"""
         current_pos = obs["pos"]
-        gates = self._gates
+        target_gate_idx = obs["target_gate"]
         
-        waypoint1 = np.copy(current_pos)  # starting point
-        waypoint2 = np.copy(gates[0])     # first gate
-        waypoint3 = np.copy(gates[1])     # second gate
-        waypoint4 = np.copy(gates[2])     # third gate
-        waypoint4[1] += 0.25              # increased y to "touch gate"
-        waypoint5 = np.copy(gates[3])     # fourth gate
-        waypoint5[1] -= 0.2               # increased y to meet velocity threshold
+        if target_gate_idx >= len(self.current_gates_pos):
+            return False, "No target gate", -1, np.zeros(3)
+            
+        target_gate_pos = self.current_gates_pos[target_gate_idx]
+        gate_quat = self.gate_quats[target_gate_idx]
+        
+        # Distance to target gate
+        dist_to_gate = np.linalg.norm(current_pos - target_gate_pos)
+        
+        # Only use gate navigation when approaching the gate
+        if dist_to_gate > self.gate_approach_distance:
+            return False, f"Gate {target_gate_idx} too far ({dist_to_gate:.2f}m)", target_gate_idx, np.zeros(3)
+        
+        # Get gate frame vectors
+        gate_normal, _, _ = self.get_gate_frame_vectors(gate_quat)
+        
+        # Check which side of the gate we're on
+        pos_to_gate = target_gate_pos - current_pos
+        dot_product = np.dot(pos_to_gate, gate_normal)
+        approach_from_behind = dot_product > 0
+        
+        # Calculate the through-point
+        gate_through_point = self.get_gate_through_point(target_gate_pos, gate_quat, approach_from_behind)
+        
+        return True, f"Gate {target_gate_idx} navigation active (dist: {dist_to_gate:.2f}m)", target_gate_idx, gate_through_point
 
+    def check_trajectory_blocking_obstacles(self, obs) -> tuple[bool, list, str]:
+        """Check for obstacles that ACTUALLY block the planned trajectory path"""
+        current_pos = obs["pos"]
+        
+        # Get trajectory points for look-ahead
+        traj_len = len(trajectory.trajectory)
+        look_ahead_end = min(self._tick + self.trajectory_look_ahead, traj_len - 1)
+        
+        if self._tick >= traj_len:
+            return False, [], "No trajectory remaining"
+        
+        blocking_obstacles = []
+        
+        # Check each obstacle
+        for i, obstacle_pos in enumerate(self.obstacles_pos):
+            is_blocking = False
+            
+            # Check if obstacle intersects with the planned trajectory path
+            for traj_idx in range(self._tick, look_ahead_end + 1):
+                traj_point = trajectory.trajectory[traj_idx, 0:3]
+                dist_to_obstacle = np.linalg.norm(traj_point - obstacle_pos)
+                
+                # Obstacle blocks trajectory if it's within the safe corridor
+                collision_distance = self.obs_radius + self.safe_distance
+                if dist_to_obstacle < collision_distance:
+                    is_blocking = True
+                    break
+            
+            # Also check if we're currently too close to this obstacle
+            current_dist = np.linalg.norm(current_pos - obstacle_pos)
+            if current_dist < self.obs_radius + self.safe_distance + 0.2:
+                is_blocking = True
+            
+            if is_blocking:
+                blocking_obstacles.append(i)
+        
+        if blocking_obstacles:
+            reason = f"Obstacles {blocking_obstacles} blocking trajectory path"
+            return True, blocking_obstacles, reason
+        
+        return False, [], "No trajectory-blocking obstacles"
+
+    def should_use_mpc(self, obs) -> tuple[bool, str, bool, bool, list, np.ndarray]:
+        """Decide when to use MPC - trajectory-first approach"""
+        
+        # Check for trajectory-blocking obstacles
+        obstacles_blocking, blocking_obstacles, obstacle_reason = self.check_trajectory_blocking_obstacles(obs)
+        
+        # Check for gate navigation need
+        gate_needs_nav, gate_reason, gate_idx, gate_through_point = self.check_gate_navigation_need(obs)
+        
+        # Use MPC when necessary
+        use_mpc = obstacles_blocking or gate_needs_nav
+        
+        if obstacles_blocking and gate_needs_nav:
+            reason = f"OBSTACLE AVOIDANCE + GATE NAVIGATION: {obstacle_reason} + {gate_reason}"
+        elif obstacles_blocking:
+            reason = f"OBSTACLE AVOIDANCE: {obstacle_reason}"
+        elif gate_needs_nav:
+            reason = f"GATE NAVIGATION: {gate_reason}"
+        else:
+            reason = "Following minsnap trajectory"
+            
+        return use_mpc, reason, gate_needs_nav, obstacles_blocking, blocking_obstacles, gate_through_point
+
+    def compute_control(
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+    ) -> NDArray[np.floating]:
+        
+        if self._tick >= len(trajectory.trajectory):
+            print(f"Trajectory finished at tick {self._tick}")
+            self._finished = True
+            return np.zeros(13, dtype=np.float32)
+        
+        # Check if MPC is needed
+        self.use_mpc, self.mpc_reason, gate_mode, obstacle_mode, blocking_obstacles, gate_through_point = self.should_use_mpc(obs)
+        
+        print(f"Tick {self._tick}, target_gate: {obs['target_gate']}, MPC: {self.use_mpc}")
+        if self.use_mpc:
+            print(f"  Modes: Gate_nav={gate_mode}, Obstacle_avoid={obstacle_mode}")
+            print(f"  Reason: {self.mpc_reason}")
+            if gate_mode:
+                print(f"  Gate through-point: {gate_through_point}")
+        
+        # Update current gate positions
+        self.current_gates_pos = np.copy(obs["gates_pos"])
+        
+        if not self.use_mpc:
+            # Follow minsnap trajectory (primary mode)
+            if self._tick < len(trajectory.trajectory):
+                position = trajectory.trajectory[self._tick, 0:3]
+                velocity = trajectory.trajectory[self._tick, 3:6] if trajectory.trajectory.shape[1] > 3 else np.zeros(3)
+                print(f"Following minsnap trajectory: pos={position}")
+                return np.concatenate((position, np.zeros(10)), dtype=np.float32)
+            else:
+                return np.zeros(13, dtype=np.float32)
+        
+        # Use MPC for corrections
+        print(f"🎯 Using MPC for corrections: {self.mpc_reason}")
+        
+        # Current state
+        pos = obs["pos"]
+        vel = obs["vel"]
+        x0 = np.hstack([pos, vel])
+        
+        # Build reference trajectory
+        traj_len = len(trajectory.trajectory)
+        slice_start = self._tick
+        slice_end = min(self._tick + self.horizon + 1, traj_len)
+        
+        if slice_start >= traj_len:
+            return np.zeros(13, dtype=np.float32)
+        
+        ref_h = trajectory.trajectory[slice_start:slice_end, :]
+        
+        # Pad if necessary
+        if ref_h.shape[0] < self.horizon + 1:
+            last_point = trajectory.trajectory[-1:, :]
+            padding_needed = self.horizon + 1 - ref_h.shape[0]
+            padding = np.tile(last_point, (padding_needed, 1))
+            ref_h = np.vstack([ref_h, padding])
+        
+        # Extract position and velocity references
+        X_r = ref_h[:, 0:6].T
+        
+        # Compute reference accelerations
+        if ref_h.shape[1] > 14:
+            U_r = ref_h[0:self.horizon, 14:17].T
+        else:
+            U_r = np.zeros((3, self.horizon))
+            for k in range(self.horizon):
+                if k + 1 < ref_h.shape[0]:
+                    vel_k = ref_h[k, 3:6]
+                    vel_k1 = ref_h[k+1, 3:6]
+                    acc_ref = (vel_k1 - vel_k) / self.dt
+                    U_r[:, k] = acc_ref - np.array([0, 0, 9.81])
+        
+        # Get gate information
+        target_gate_idx = obs["target_gate"]
+        if target_gate_idx < len(self.current_gates_pos):
+            target_gate_pos = self.current_gates_pos[target_gate_idx]
+        else:
+            target_gate_pos = pos
+        
+        # Create obstacle blocking mask
+        obstacle_mask = np.zeros(len(self.obstacles_pos))
+        for obs_idx in blocking_obstacles:
+            obstacle_mask[obs_idx] = 1.0
+        
+        # Set MPC parameters
+        try:
+            self._mpc_solver.set_value(self._X0_param, x0)
+            self._mpc_solver.set_value(self.X_ref_param, X_r)
+            self._mpc_solver.set_value(self.U_ref_param, U_r)
+            self._mpc_solver.set_value(self._obstacles_param, obs["obstacles_pos"].T)
+            self._mpc_solver.set_value(self._target_gate_pos_param, target_gate_pos)
+            self._mpc_solver.set_value(self._gate_through_point_param, gate_through_point)
+            
+            # Set mode flags
+            self._mpc_solver.set_value(self._gate_navigation_mode_param, 1.0 if gate_mode else 0.0)
+            self._mpc_solver.set_value(self._obstacle_avoidance_mode_param, 1.0 if obstacle_mode else 0.0)
+            self._mpc_solver.set_value(self._blocking_obstacles_param, obstacle_mask)
+            
+            # Solve MPC
+            sol = self._mpc_solver.solve()
+            
+            # Extract solution
+            X_sol = sol.value(self.X_var)
+            U_sol = sol.value(self.U_var)
+            
+            # Use MPC's recommended position (one step ahead)
+            pos_cmd = X_sol[0:3, 1]
+            vel_cmd = X_sol[3:6, 1]
+            acc_cmd = U_sol[:, 0] + np.array([0, 0, 9.81])
+            
+            print(f"✅ MPC solved: pos_cmd={pos_cmd}")
+            
+            return np.concatenate((pos_cmd, vel_cmd, acc_cmd, np.zeros(4)), dtype=np.float32)
+            
+        except RuntimeError as e:
+            print(f"❌ MPC solve failed: {e}")
+            print("🔄 Falling back to minsnap trajectory")
+            
+            # Fallback: use minsnap trajectory
+            if self._tick < len(trajectory.trajectory):
+                position = trajectory.trajectory[self._tick, 0:3]
+                velocity = trajectory.trajectory[self._tick, 3:6] if trajectory.trajectory.shape[1] > 3 else np.zeros(3)
+                return np.concatenate((position, velocity, np.zeros(7)), dtype=np.float32)
+            else:
+                return np.zeros(13, dtype=np.float32)
+    
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Increment the time step counter."""
+        self._tick += 1
+        if self._tick % 10 == 0:
+            mode_str = "🎯 MPC CORRECTIONS" if self.use_mpc else "📍 MINSNAP TRAJECTORY"
+            print(f"Step {self._tick}, reward: {reward:.3f}, Mode: {mode_str}")
+            if self.use_mpc:
+                print(f"   MPC Reason: {self.mpc_reason}")
+        return self._finished
+    
+    def make_refs(self):
+        """Generate waypoints with gate orientation consideration"""
+        waypoint1 = self.initial_pos.copy()
+        
+        # For each gate, calculate a point that considers the gate orientation
+        gate_waypoints = []
+        for i in range(len(self.current_gates_pos)):
+            gate_pos = self.current_gates_pos[i].copy()
+            gate_quat = self.gate_quats[i]
+            
+            # Get gate orientation
+            gate_normal, _, _ = self.get_gate_frame_vectors(gate_quat)
+            
+            # For waypoint generation, aim for a point slightly before the gate
+            # This ensures the trajectory approaches from the correct side
+            approach_offset = 0.2  # 20cm before gate center
+            waypoint_pos = gate_pos - approach_offset * gate_normal
+            
+            gate_waypoints.append(waypoint_pos)
+        
+        # Create waypoints
         refs = [
-            # starting point
             ms.Waypoint(
                 time=0.0,
                 position=np.array(waypoint1),
                 velocity=np.array([0.0, 0.0, 0.0]),
                 acceleration=np.array([0.0, 0.0, 0.0]),
-                jerk=np.array([0.0, 0.0, 0.0]),
+                jerk=np.array([0.0, 0.0, 0.0])
             ),
-            # first gate
             ms.Waypoint(
                 time=2.0,
-                position=np.array(waypoint2),
+                position=np.array(gate_waypoints[0]),
             ),
-            # second gate
-            ms.Waypoint(
+            ms.Waypoint( 
                 time=4.0,
-                position=np.array(waypoint3),
-                velocity=np.array([0.8, 0.8, 0.0])
+                position=np.array(gate_waypoints[1]),
+                velocity=np.array([0.6, 0.6, 0.0])
             ),
-            # third gate
             ms.Waypoint(
                 time=6.7,
-                position=np.array(waypoint4),
+                position=np.array(gate_waypoints[2]),
                 velocity=np.array([0.0, 0.0, 0.0]),
             ),
-            # fourth gate
             ms.Waypoint(
-                time=9.0,
-                position=np.array(waypoint5)
+                time=self._t_total,
+                position=np.array(gate_waypoints[3]),
             ),
         ]
-        
-        print(f"DEBUG: Generated {len(refs)} waypoints for trajectory")
-        for i, ref in enumerate(refs):
-            print(f"  Waypoint {i}: t={ref.time:.1f}, pos={ref.position}")
-
         return refs
 
-    def _generate_reference_trajectory(self, obs):
-        print("DEBUG: Generating reference trajectory")
-        
-        try:
-            refs = self.make_refs(obs)
-            print(f"DEBUG: Reference waypoints created: {len(refs)}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to make refs: {e}")
-            traceback.print_exc()
-            raise
-            
-        try:
-            t_total = 9.0
-            print(f"DEBUG: Total time: {t_total}")
-            
-            polys = minsnap.generate_trajectory(refs, t_total)
-            print(f"DEBUG: Generated trajectory polynomials shape: {polys.shape}")
-            
-            t_orig = np.linspace(0, t_total, len(polys))
-            t_eval = np.linspace(0, t_total, int(t_total*self._freq)+1)
-            print(f"DEBUG: Original time points: {len(t_orig)}, Eval time points: {len(t_eval)}")
+# Utility functions remain the same
+def quat_to_rotmat(q):
+    x, y, z, w = q
+    R = np.array([
+        [1 - 2 * (y**2 + z**2),     2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x**2 + z**2),     2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x**2 + y**2)]
+    ])
+    return R
 
-            pos = polys[:,0:3]
-            vel = polys[:,3:6] 
-            acc = polys[:,6:9]
-            print(f"DEBUG: Extracted pos shape: {pos.shape}, vel shape: {vel.shape}, acc shape: {acc.shape}")
-            
-            if len(polys) != len(t_eval):
-                print(f"DEBUG: Interpolating trajectory from {len(polys)} to {len(t_eval)} points")
-                pos_i = np.zeros((len(t_eval),3))
-                vel_i = np.zeros_like(pos_i)
-                acc_i = np.zeros_like(pos_i)
-                
-                for i in range(3):
-                    pos_i[:,i] = np.interp(t_eval, t_orig, pos[:,i])
-                    vel_i[:,i] = np.interp(t_eval, t_orig, vel[:,i])
-                    acc_i[:,i] = np.interp(t_eval, t_orig, acc[:,i])
-                    
-                pos, vel, acc = pos_i, vel_i, acc_i
-                print(f"DEBUG: Interpolated shapes - pos: {pos.shape}, vel: {vel.shape}, acc: {acc.shape}")
+def quat_to_euler(q):
+    x, y, z, w = q
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
 
-            self._t_total = t_eval[-1]
-            print(f"DEBUG: Total trajectory time: {self._t_total}")
-            
-            # Set global trajectory (this line might be problematic)
-            try:
-                trajectory.trajectory = interpolate_trajectory_linear(polys, 2)
-                print("DEBUG: Global trajectory set successfully")
-            except Exception as e:
-                print(f"DEBUG WARNING: Failed to set global trajectory: {e}")
-                
-            self._reference_trajectory = {"t":t_eval, "pos":pos.T, "vel":vel.T, "acc":acc.T}
-            print(f"DEBUG: Reference trajectory stored with shapes:")
-            print(f"DEBUG:   t: {self._reference_trajectory['t'].shape}")
-            print(f"DEBUG:   pos: {self._reference_trajectory['pos'].shape}")
-            print(f"DEBUG:   vel: {self._reference_trajectory['vel'].shape}")
-            print(f"DEBUG:   acc: {self._reference_trajectory['acc'].shape}")
-            
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to generate trajectory: {e}")
-            traceback.print_exc()
-            raise
+    sinp = 2 * (w * y - z * x)
+    if abs(sinp) >= 1:
+        pitch = np.pi / 2 * np.sign(sinp)
+    else:
+        pitch = np.arcsin(sinp)
 
-    def _setup_mpc(self):
-        print("DEBUG: Setting up MPC")
-        
-        try:
-            opti = ca.Opti()
-            nx, nu, N = 6, 3, self._horizon
-            print(f"DEBUG: MPC dimensions - nx: {nx}, nu: {nu}, N: {N}")
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
 
-            # Variables
-            X = opti.variable(nx, N+1)
-            U = opti.variable(nu, N)
-            X_ref = opti.parameter(nx, N+1)
-            print("DEBUG: MPC variables created")
-
-            # Adaptive weight params
-            Qp = opti.parameter()
-            Qv = opti.parameter()
-            Qg = opti.parameter()
-            print("DEBUG: Weight parameters created")
-
-            # Other params
-            obs_pos = opti.parameter(3, self._max_obs)
-            obs_rad = opti.parameter(self._max_obs)
-            gate_pos = opti.parameter(3, self._max_gates)
-            gate_wt = opti.parameter(self._max_gates)
-            U_ref = opti.parameter(nu, N)
-            print("DEBUG: Other parameters created")
-
-            # Active gate
-            active_gate = gate_pos @ gate_wt
-            print("DEBUG: Active gate expression created")
-
-            # Control weights
-            R = ca.diag([self._R_acc]*3)
-            Rr = ca.diag([self._R_acc_ref]*3)
-            print("DEBUG: Control weight matrices created")
-
-            # Cost
-            print("DEBUG: Building cost function")
-            cost = 0
-            for k in range(N):
-                e = X[:,k]-X_ref[:,k]
-                cost += Qp*ca.sumsqr(e[0:3]) + Qv*ca.sumsqr(e[3:6])
-                d = X[0:3,k]-active_gate
-                cost += Qg*ca.sumsqr(d)
-                cost += ca.mtimes([U[:,k].T, R, U[:,k]])
-                er = U[:,k]-U_ref[:,k]
-                cost += ca.mtimes([er.T, Rr, er])
-
-            eN = X[:,N]-X_ref[:,N]
-            cost += Qp*2*ca.sumsqr(eN[0:3]) + Qv*2*ca.sumsqr(eN[3:6])
-            opti.minimize(cost)
-            print("DEBUG: Cost function built and set")
-
-            # ZOH dynamics
-            print("DEBUG: Setting up dynamics")
-            I3, dt = ca.DM.eye(3), self.dt
-            A = ca.DM.zeros((6,6))
-            A[0:3,0:3] = I3
-            A[0:3,3:6] = dt*I3
-            A[3:6,3:6] = I3
-            
-            B = ca.DM.zeros((6,3))
-            B[0:3,0:3] = 0.5*dt**2*I3
-            B[3:6,0:3] = dt*I3
-            
-            for k in range(N):
-                opti.subject_to(X[:,k+1] == A@X[:,k] + B@U[:,k])
-            print("DEBUG: Dynamics constraints added")
-
-            # Initial condition
-            X0 = opti.parameter(nx)
-            opti.subject_to(X[:,0] == X0)
-            print("DEBUG: Initial condition constraint added")
-
-            # Obstacles
-            print("DEBUG: Adding obstacle constraints")
-            margin = 0.1
-            for k in range(N+1):
-                for i in range(self._max_obs):
-                    dxy = ca.sqrt(ca.sumsqr(X[0:2,k]-obs_pos[0:2,i])+1e-8)
-                    opti.subject_to(dxy >= obs_rad[i] + margin)
-            print("DEBUG: Obstacle constraints added")
-
-            # Limits
-            print("DEBUG: Adding input/state limits")
-            for k in range(N):
-                opti.subject_to(U[:,k] >= -self._u_max)
-                opti.subject_to(U[:,k] <= self._u_max)
-                vlim = 5.0
-                opti.subject_to(X[3:6,k] >= -vlim)
-                opti.subject_to(X[3:6,k] <= vlim)
-            print("DEBUG: Limits added")
-
-            # Solver options
-            opts = {"ipopt.print_level":0,"print_time":0,
-                    "ipopt.max_iter":200,"ipopt.tol":1e-6,
-                    "ipopt.acceptable_tol":1e-4,
-                    "ipopt.warm_start_init_point":"no"}
-            opti.solver("ipopt", opts)
-            print("DEBUG: Solver configured")
-
-            # Store handles
-            self._mpc_solver = opti
-            self._X0_param = X0
-            self._X_ref_param = X_ref
-            self._Qp_param = Qp
-            self._Qv_param = Qv
-            self._Qg_param = Qg
-            self._obs_pos_param = obs_pos
-            self._obs_rad_param = obs_rad
-            self._gate_pos_param = gate_pos
-            self._gate_wt_param = gate_wt
-            self._U_ref_param = U_ref
-            self._X_var = X
-            self._U_var = U
-            
-            print("DEBUG: MPC setup complete")
-            
-        except Exception as e:
-            print(f"DEBUG ERROR: MPC setup failed: {e}")
-            traceback.print_exc()
-            raise
-
-    def _interpolate_reference(self, t0):
-        print(f"DEBUG: Interpolating reference at t0={t0}")
-        
-        traj = self._reference_trajectory
-        if traj is None:
-            print("DEBUG WARNING: No reference trajectory available")
-            return np.zeros((6,self._horizon+1)), np.zeros((3,self._horizon))
-            
-        tfull = np.linspace(t0, t0+self._horizon*self.dt, self._horizon+1)
-        tctrl = tfull[:-1]
-        T = traj["t"]
-        
-        print(f"DEBUG: Interpolation time range: {tfull[0]:.3f} to {tfull[-1]:.3f}")
-        print(f"DEBUG: Reference time range: {T[0]:.3f} to {T[-1]:.3f}")
-        
-        try:
-            pos = np.vstack([np.interp(tfull, T, traj["pos"][i]) for i in range(3)])
-            vel = np.vstack([np.interp(tfull, T, traj["vel"][i]) for i in range(3)])
-            acc = np.vstack([np.interp(tctrl, T, traj["acc"][i]) for i in range(3)])
-            
-            print(f"DEBUG: Interpolated shapes - pos: {pos.shape}, vel: {vel.shape}, acc: {acc.shape}")
-            return np.vstack([pos,vel]), acc
-            
-        except Exception as e:
-            print(f"DEBUG ERROR: Interpolation failed: {e}")
-            traceback.print_exc()
-            return np.zeros((6,self._horizon+1)), np.zeros((3,self._horizon))
-
-    def _get_time_gate_weight(self, t, gates):
-        print(f"DEBUG: Getting time-based gate weight at t={t}")
-        
-        idx = 0
-        for i, gt in enumerate(self._gate_times[1:], 1):
-            if t < gt + 0.5:
-                idx = i - 1
-                break
-        idx = min(idx, len(gates) - 1)
-        
-        w = np.zeros(self._max_gates)
-        if idx < len(gates):
-            w[idx] = 1.0
-            
-        print(f"DEBUG: Gate weight vector: {w}, active gate index: {idx}")
-        return w
-
-    def _get_adaptive_weights(self, pos, vel, gates):
-        print(f"DEBUG: Computing adaptive weights")
-        print(f"DEBUG: Position: {pos}, Velocity: {vel}")
-        
-        baseQp, baseQv, baseQg = 50, 15, 50
-        
-        if gates and self._current_gate_index < len(gates):
-            d = np.linalg.norm(pos - gates[self._current_gate_index])
-            print(f"DEBUG: Distance to current gate {self._current_gate_index}: {d}")
-            
-            if d < 2.0:
-                Qp, Qv, Qg = baseQp*0.7, baseQv*1.2, baseQg*1.5
-                print("DEBUG: Close to gate - reducing position weight, increasing velocity/gate weights")
-            elif d > 4.0:
-                Qp, Qv, Qg = baseQp*1.3, baseQv, baseQg*0.8
-                print("DEBUG: Far from gate - increasing position weight, reducing gate weight")
-            else:
-                Qp, Qv, Qg = baseQp, baseQv, baseQg
-                print("DEBUG: Medium distance - using base weights")
-        else:
-            Qp, Qv, Qg = baseQp*1.5, baseQv*1.2, 0
-            print("DEBUG: No valid gates - focusing on trajectory tracking")
-            
-        s = np.linalg.norm(vel)
-        print(f"DEBUG: Speed: {s}")
-        
-        if s > 3.0:
-            Qv *= 1.3
-            Qp *= 1.1
-            print("DEBUG: High speed - increasing velocity/position weights")
-        elif s < 1.0:
-            Qg *= 1.2
-            print("DEBUG: Low speed - increasing gate weight")
-            
-        print(f"DEBUG: Final weights - Qp: {Qp}, Qv: {Qv}, Qg: {Qg}")
-        return Qp, Qv, Qg
-
-    def compute_control(self, obs, info=None):
-        print(f"\nDEBUG: ===== Computing control at tick {self._tick} =====")
-        
-        if self._mpc_solver is None:
-            print("DEBUG: MPC solver not initialized, setting up...")
-            try:
-                self._setup_mpc()
-                print("DEBUG: MPC solver setup successful")
-            except Exception as e:
-                print(f"DEBUG ERROR: MPC setup failed: {e}")
-                return np.zeros(13, dtype=np.float32)
-
-        t = min(self._tick / self._freq, self._t_total)
-        print(f"DEBUG: Current time: {t:.3f}, Total time: {self._t_total:.3f}")
-        
-        if t >= self._t_total - 0.1:
-            print("DEBUG: Trajectory finished, returning final position")
-            self._finished = True
-            if self._reference_trajectory is not None:
-                fpos = self._reference_trajectory["pos"][:, -1]
-                return np.concatenate((fpos, np.zeros(10)), dtype=np.float32)
-            else:
-                return np.zeros(13, dtype=np.float32)
-
-        try:
-            pos = obs["pos"]
-            vel = obs.get("vel", np.zeros(3))
-            print(f"DEBUG: Current state - pos: {pos}, vel: {vel}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to get state from obs: {e}")
-            return np.zeros(13, dtype=np.float32)
-
-        x0 = np.concatenate([pos, vel])
-        print(f"DEBUG: Initial state x0: {x0}")
-
-        try:
-            (traj, acc_ref) = self._interpolate_reference(t)
-            print(f"DEBUG: Reference interpolation successful")
-        except Exception as e:
-            print(f"DEBUG ERROR: Reference interpolation failed: {e}")
-            return self._fallback_control(t, pos, vel)
-
-        # Process obstacles
-        print("DEBUG: Processing obstacles")
-        obs_p = np.zeros((3, self._max_obs))
-        obs_r = np.zeros(self._max_obs)
-        obstacles = obs.get("obstacles_pos", [])
-        print(f"DEBUG: Found {len(obstacles)} obstacles in obs")
-        
-        for i, o in enumerate(obstacles[:self._max_obs]):
-            try:
-                obs_p[:, i] = o["pos"]
-                obs_r[i] = o.get("radius", 0.25)
-                print(f"DEBUG: Obstacle {i}: pos={obs_p[:,i]}, radius={obs_r[i]}")
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed to process obstacle {i}: {e}")
-
-        # Process gates
-        print("DEBUG: Processing gates")
-        gate_p = np.zeros((3, self._max_gates))
-        gates = self._gates
-        
-        
-        for i, g in enumerate(gates[:self._max_gates]):
-            try:
-                gate_p[:, i] = g
-                print(f"DEBUG: Gate {i}: pos={gate_p[:,i]}")
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed to process gate {i}: {e}")
-
-        # Compute adaptive weights and gate weights
-        try:
-            Qp, Qv, Qg = self._get_adaptive_weights(pos, vel, gates)
-            gate_w = self._get_time_gate_weight(t, gates)
-            print(f"DEBUG: Weights computed - Qp: {Qp}, Qv: {Qv}, Qg: {Qg}")
-            print(f"DEBUG: Gate weights: {gate_w}")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to compute weights: {e}")
-            Qp, Qv, Qg = 50, 15, 50
-            gate_w = np.zeros(self._max_gates)
-
-        # Set MPC parameters
-        print("DEBUG: Setting MPC parameters")
-        try:
-            s = self._mpc_solver
-            s.set_value(self._X0_param, x0)
-            s.set_value(self._X_ref_param, traj)
-            s.set_value(self._Qp_param, Qp)
-            s.set_value(self._Qv_param, Qv)
-            s.set_value(self._Qg_param, Qg)
-            s.set_value(self._obs_pos_param, obs_p)
-            s.set_value(self._obs_rad_param, obs_r)
-            s.set_value(self._gate_pos_param, gate_p)
-            s.set_value(self._gate_wt_param, gate_w)
-            s.set_value(self._U_ref_param, acc_ref)
-            print("DEBUG: MPC parameters set successfully")
-        except Exception as e:
-            print(f"DEBUG ERROR: Failed to set MPC parameters: {e}")
-            traceback.print_exc()
-            return self._fallback_control(t, pos, vel)
-
-        # Warm start
-        if hasattr(self, "_last_solution"):
-            print("DEBUG: Applying warm start")
-            try:
-                
-                Uw = self._last_solution["U"]
-                
-                Us = np.hstack([Uw[:, 1:], np.zeros((3, 1))])
-                
-                s.set_initial(self._U_var, Us)
-                print("DEBUG: Warm start applied successfully")
-            except Exception as e:
-                print(f"DEBUG WARNING: Warm start failed: {e}")
-
-        # Solve MPC
-        print("DEBUG: Solving MPC")
-        try:
-            sol = s.solve()
-            print("DEBUG: MPC solved successfully")
-            
-            Uopt = sol.value(self._U_var[:, 0])
-            print(f"DEBUG: Optimal control: {Uopt}")
-            
-            self._last_solution = {"X": sol.value(self._X_var), "U": sol.value(self._U_var)}
-            
-            pd, pv = traj[0:3, 0], traj[3:6, 0]
-            result = np.concatenate((pd, pv, Uopt, np.zeros(4)), dtype=np.float32)
-            print(f"DEBUG: Returning control: {result}")
-            return result
-            
-        except Exception as e:
-            print(f"DEBUG ERROR: MPC solve failed: {e}")
-            traceback.print_exc()
-            return self._fallback_control(t, pos, vel)
-
-    def _fallback_control(self, t, pos, vel):
-        print(f"DEBUG: Using fallback control at t={t}")
-        
-        traj = self._reference_trajectory
-        if traj is None:
-            print("DEBUG WARNING: No reference trajectory for fallback")
-            return np.concatenate((pos, np.zeros(10)), dtype=np.float32)
-            
-        try:
-            T = traj["t"]
-            pd = np.array([np.interp(t, T, traj["pos"][i]) for i in range(3)])
-            vd = np.array([np.interp(t, T, traj["vel"][i]) for i in range(3)])
-            ad = np.array([np.interp(t, T, traj["acc"][i]) for i in range(3)])
-            
-            print(f"DEBUG: Fallback desired state - pos: {pd}, vel: {vd}, acc: {ad}")
-            
-            e = pd - pos
-            f = vd - vel
-            u = 8.0 * e + 4.0 * f + ad
-            u = np.clip(u, -self._u_max, self._u_max)
-            
-            print(f"DEBUG: Fallback control - error: {e}, vel_error: {f}, control: {u}")
-            
-            result = np.concatenate((pd, vd, u, np.zeros(4)), dtype=np.float32)
-            print(f"DEBUG: Fallback returning: {result}")
-            return result
-            
-        except Exception as e:
-            print(f"DEBUG ERROR: Fallback control failed: {e}")
-            traceback.print_exc()
-            return np.concatenate((pos, np.zeros(10)), dtype=np.float32)
-
-    def step_callback(self, *args, **kwargs):
-        print(f"DEBUG: Step callback called, tick: {self._tick}, finished: {self._finished}")
-        self._tick += 1
-        return self._finished
-
-    def reset(self):
-        print("DEBUG: Resetting controller")
-        super().reset()
-        self._tick = 0
-        self._finished = False
-        self._mpc_solver = None
-        self._completion_counter = 0
-        if hasattr(self, "_last_solution"):
-            delattr(self, "_last_solution")
-        print("DEBUG: Controller reset complete")
+    return roll, pitch, yaw
 
 def interpolate_trajectory_linear(trajectory, interpolation_factor=2):
-    print(f"DEBUG: Interpolating trajectory with factor {interpolation_factor}")
-    print(f"DEBUG: Input trajectory shape: {trajectory.shape}")
-    
-    try:
-        N = trajectory.shape[0]
-        result = []
-        
-        for i in range(N-1):
-            a, b = trajectory[i], trajectory[i+1]
-            for k in range(interpolation_factor):
-                alpha = k / interpolation_factor
-                result.append((1-alpha)*a + alpha*b)
-        result.append(trajectory[-1])
-        
-        result_array = np.array(result)
-        print(f"DEBUG: Interpolated trajectory shape: {result_array.shape}")
-        return result_array
-        
-    except Exception as e:
-        print(f"DEBUG ERROR: Trajectory interpolation failed: {e}")
-        traceback.print_exc()
-        return trajectory
+    """Linearly interpolates between trajectory points."""
+    if interpolation_factor < 1:
+        raise ValueError("interpolation_factor must be >= 1")
+
+    N = trajectory.shape[0]
+    result = []
+
+    for i in range(N - 1):
+        a = trajectory[i]
+        b = trajectory[i + 1]
+
+        for k in range(interpolation_factor):
+            alpha = k / interpolation_factor
+            point = (1 - alpha) * a + alpha * b
+            result.append(point)
+
+    result.append(trajectory[-1])
+    return np.array(result)
