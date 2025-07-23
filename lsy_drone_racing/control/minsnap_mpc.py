@@ -27,17 +27,17 @@ class MinSnapTracker(Controller):
         self.Q_pos = 200      # High trajectory tracking weight
         self.Q_vel = 10       # High velocity tracking weight
         self.R_acc = 0.1        # Control effort
-        self.U_max = 8
-        self.vel_max = 2
+        self.U_max = 15
+        self.vel_max = 5
 
         # Gate navigation parameters
         self.gate_approach_distance = 0.4  # Start considering gate orientation at this distance
         self.gate_passage_offset = 0.3      # How far ahead/behind gate center to aim for
-        self.gate_alignment_penalty = 5000  # Strong penalty for not aligning with gate orientation
+        self.gate_alignment_penalty = 1000  # Strong penalty for not aligning with gate orientation
         self.gate_opening_radius = 0.2      # Safe passage radius
         
         # Obstacle avoidance - ONLY for obstacles in trajectory path
-        self.obstacle_penalty = 2000
+        self.obstacle_penalty = 500
         self.obs_radius = 0.3
         self.safe_distance = 0.05
         self.trajectory_look_ahead = 3      # Look further ahead on trajectory
