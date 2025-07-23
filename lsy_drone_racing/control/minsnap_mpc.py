@@ -1,3 +1,4 @@
+# Author: Amir Suhail Salim
 from lsy_drone_racing.control import Controller
 import numpy as np
 from numpy.typing import NDArray
