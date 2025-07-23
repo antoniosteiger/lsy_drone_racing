@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 
 import numpy as np # needed for np.array
 
+TRAJECTORY_THICKNESS = 5.0
+TRAJECTORY_COLOR = np.array([1.0, 1.0, 0.0, 1.0])
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +54,6 @@ def simulate(
     Returns:
         A list of episode times.
     """
-
-    # Settings
-    trajectory_color = np.array([1.0, 0, 0, 1])
 
     if trajectory_visualization:
         print("SIM: Trajectory visualization enabled.")
@@ -115,7 +115,7 @@ def simulate(
                         # EXTENDED: Draw trajectory line
                         if trajectory_visualization:
                             # draw the trajectory line
-                            draw_trajectory(env, trajectory.trajectory, trajectory_color)
+                            draw_trajectory(env, trajectory.trajectory, TRAJECTORY_COLOR)
                 i += 1
 
             controller.episode_callback()  # Update the controller internal state and models.
@@ -131,7 +131,7 @@ def simulate(
                     env.render()
                     if trajectory_visualization:
                         # draw the trajectory line
-                        draw_trajectory(env, trajectory.trajectory, trajectory_color)
+                        draw_trajectory(env, trajectory.trajectory, TRAJECTORY_COLOR)
                 i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")
@@ -162,7 +162,7 @@ def draw_trajectory(env, trajectory, color):
     # Draw the trajectory line
     trajectory = trajectory[:, 0:3]  # Only take the x, y, z coordinates
     trajectory = decimate(trajectory, 500)
-    draw_line(env, trajectory, color)
+    draw_line(env, trajectory, color, TRAJECTORY_THICKNESS, TRAJECTORY_THICKNESS)
 
 
 if __name__ == "__main__":
