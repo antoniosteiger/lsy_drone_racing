@@ -1,6 +1,8 @@
-# This file makes sure we have a way to access the real-time updated trajectory from the controller
-# in the simulation to visualize it in the GUI.
-# We import it in the controller to write the trajectory and
-# import it in the sim to visualize it.
+"""Trajectory Sharing Module.
+
+Explanation:
+    This is a global variable that can safely be imported and used for trajectory visualization.
+    The visualization thread will read from this variable, while controllers can write to it.
+"""
 
 trajectory = None

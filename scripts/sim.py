@@ -17,8 +17,8 @@ import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller, draw_line
 import lsy_drone_racing.utils.trajectory as trajectory
+from lsy_drone_racing.utils import draw_line, load_config, load_controller
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -26,8 +26,10 @@ if TYPE_CHECKING:
     from lsy_drone_racing.control.controller import Controller
     from lsy_drone_racing.envs.drone_race import DroneRaceEnv
 
-import numpy as np # needed for np.array
+import numpy as np  # needed for np.array
 
+TRAJECTORY_THICKNESS = 5.0
+TRAJECTORY_COLOR = np.array([1.0, 1.0, 0.0, 1.0])
 
 logger = logging.getLogger(__name__)
 
@@ -47,17 +49,14 @@ def simulate(
             the controller specified in the config file is used.
         n_runs: The number of episodes.
         gui: Enable/disable the simulation GUI.
+        trajectory_visualization: Enable/disable trajectory visualization in the GUI
 
     Returns:
         A list of episode times.
     """
-
-    # Settings
-    trajectory_color = np.array([1.0, 0, 0, 1])
-
     if trajectory_visualization:
         print("SIM: Trajectory visualization enabled.")
-    
+
     # Load configuration and check if firmare should be used.
     config = load_config(Path(__file__).parents[1] / "config" / config)
     if gui is None:
@@ -86,7 +85,7 @@ def simulate(
     env = JaxToNumpy(env)
 
     ep_times = []
-    
+
     try:
         for _ in range(n_runs):  # Run n_runs episodes with the controller
             obs, info = env.reset()
@@ -110,18 +109,18 @@ def simulate(
                 if config.sim.gui:
                     if ((i * fps) % config.env.freq) < fps:
                         env.render()
-                        
+
                         # EXTENDED: Draw trajectory line
                         if trajectory_visualization:
                             # draw the trajectory line
-                            draw_trajectory(env, trajectory.trajectory, trajectory_color)
+                            draw_trajectory(env, trajectory.trajectory, TRAJECTORY_COLOR)
                 i += 1
 
             controller.episode_callback()  # Update the controller internal state and models.
             log_episode_stats(obs, info, config, curr_time)
             controller.episode_reset()
             ep_times.append(curr_time if obs["target_gate"] == -1 else None)
-        
+
         # EXTENDED: Keep GUI open
         i = 0
         if config.sim.gui:
@@ -130,7 +129,7 @@ def simulate(
                     env.render()
                     if trajectory_visualization:
                         # draw the trajectory line
-                        draw_trajectory(env, trajectory.trajectory, trajectory_color)
+                        draw_trajectory(env, trajectory.trajectory, TRAJECTORY_COLOR)
                 i += 1
     except KeyboardInterrupt:
         print("Closing visualization.")
@@ -150,18 +149,22 @@ def log_episode_stats(obs: dict, info: dict, config: ConfigDict, curr_time: floa
         f"Flight time (s): {curr_time}\nFinished: {finished}\nGates passed: {gates_passed}\n"
     )
 
+
 def decimate(arr: np.ndarray, max_len: int) -> np.ndarray:
+    """Remove points from trajectory until maximum trajectory length is reached."""
     length = len(arr)
     if length <= max_len:
         return arr
     step = int(np.ceil(length / max_len))
     return arr[::step]
 
-def draw_trajectory(env, trajectory, color):
+
+def draw_trajectory(env: dict, trajectory: np.typing.NDArray, color: np.typing.NDArray):
+    """Draw trajectory using draw_line function from utils."""
     # Draw the trajectory line
     trajectory = trajectory[:, 0:3]  # Only take the x, y, z coordinates
     trajectory = decimate(trajectory, 500)
-    draw_line(env, trajectory, color)
+    draw_line(env, trajectory, color, TRAJECTORY_THICKNESS, TRAJECTORY_THICKNESS)
 
 
 if __name__ == "__main__":
