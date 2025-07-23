@@ -24,23 +24,23 @@ class MinSnapTracker(Controller):
         self.mass = 0.027
 
         # MPC parameters - TRAJECTORY FOLLOWING PRIORITIZED
-        self.Q_pos = 100      # High trajectory tracking weight
-        self.Q_vel = 50       # High velocity tracking weight
-        self.R_acc = 1        # Control effort
-        self.U_max = 15
-        self.vel_max = 5
+        self.Q_pos = 200      # High trajectory tracking weight
+        self.Q_vel = 10       # High velocity tracking weight
+        self.R_acc = 0.1        # Control effort
+        self.U_max = 8
+        self.vel_max = 2
 
         # Gate navigation parameters
-        self.gate_approach_distance = 1.0   # Start considering gate orientation at this distance
+        self.gate_approach_distance = 0.4  # Start considering gate orientation at this distance
         self.gate_passage_offset = 0.3      # How far ahead/behind gate center to aim for
-        self.gate_alignment_penalty = 2000  # Strong penalty for not aligning with gate orientation
-        self.gate_opening_radius = 0.4      # Safe passage radius
+        self.gate_alignment_penalty = 5000  # Strong penalty for not aligning with gate orientation
+        self.gate_opening_radius = 0.2      # Safe passage radius
         
         # Obstacle avoidance - ONLY for obstacles in trajectory path
         self.obstacle_penalty = 2000
-        self.obs_radius = 0.25
-        self.safe_distance = 0.2
-        self.trajectory_look_ahead = 8      # Look further ahead on trajectory
+        self.obs_radius = 0.3
+        self.safe_distance = 0.05
+        self.trajectory_look_ahead = 3      # Look further ahead on trajectory
         self.trajectory_width = 0.3         # Consider obstacles within this distance of trajectory path
         
         # Store initial conditions
@@ -52,8 +52,6 @@ class MinSnapTracker(Controller):
         # Use the correct key for gate quaternions
         if "gates_quat" in obs:
             self.gate_quats = obs["gates_quat"]
-        elif "gates_quant" in obs:  # Typo in your code?
-            self.gate_quats = obs["gates_quant"]
         else:
             print("WARNING: No gate quaternions found, using default orientations")
             # Default to gates facing along y-axis
