@@ -119,6 +119,7 @@ def simulate(
 
             controller.episode_callback()  # Update the controller internal state and models.
             log_episode_stats(obs, info, config, curr_time)
+            # np.savetxt("trajectory.txt", trajectory.trajectory[:, :3], fmt="%.5f")
             controller.episode_reset()
             ep_times.append(curr_time if obs["target_gate"] == -1 else None)
         
@@ -161,7 +162,7 @@ def draw_trajectory(env, trajectory, color):
     # Draw the trajectory line
     trajectory = trajectory[:, 0:3]  # Only take the x, y, z coordinates
     trajectory = decimate(trajectory, 500)
-    draw_line(env, trajectory, color, 10.0, 10.0)
+    draw_line(env, trajectory, color, 5.0, 5.0)
 
 
 if __name__ == "__main__":

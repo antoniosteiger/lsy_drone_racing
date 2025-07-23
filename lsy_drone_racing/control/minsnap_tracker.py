@@ -70,9 +70,15 @@ class MinSnapTracker(Controller):
         Returns:
             True if the controller is finished, False otherwise.
         """
+        print("Pos: ", obs["pos"])
+        print("Goal: ", trajectory.trajectory[self._tick, :3])
         self._tick += 1
         # print(obs["target_gate"])
         return self._finished
+    
+    def episode_callback(self):
+        """Reset the integral error."""
+        print(self.current_gates_pos)
 
     def is_obs_different(self, gates_pos):
         for i in range(len(gates_pos)):

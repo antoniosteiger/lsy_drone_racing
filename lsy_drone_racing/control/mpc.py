@@ -6,6 +6,8 @@ import lsy_drone_racing.utils.path_planner2 as pp
 import lsy_drone_racing.utils.trajectory as trajectory
 from scipy.spatial.transform import Rotation as R
 
+NUM_POINTS = 600
+
 # Drone data
 mass = 0.028  # kg
 gravitational_accel = 9.80665  # m/s^2
@@ -59,12 +61,12 @@ class MPC(Controller):
         # path planner
         self.pp = pp.PathPlanner(self.pos, self.gates_pos, self.gates_rpy, self.obstacles_pos)
         self.path = self.pp.path
-        trajectory.trajectory = self.path
         
         # settings
-        self._interpolation_factor = 3
+        self._interpolation_factor = 1
         
-        self.path = self.interpolate_trajectory_linear(self.path, self._interpolation_factor)
+        self.path = self.interpolate_to_n_points(self.path, NUM_POINTS)
+        trajectory.trajectory = self.path
         
         # self.pp.plot()
 
@@ -77,25 +79,24 @@ class MPC(Controller):
         gates_pos = np.array(obs["gates_pos"])
         obstacles_pos = np.array(obs["obstacles_pos"])
         gates_rpy = np.array([self.quaternion_to_rpy(quat) for quat in obs["gates_quat"]])
+
+        self.tick += 1
+        if(self.tick >= len(self.path)-1):
+            self.finished = True
         
         if self.is_obs_different(gates_pos, obstacles_pos):
             self.gates_pos = gates_pos
             self.obstacles_pos = obstacles_pos
             self.gates_rpy = gates_rpy
             
-            self.path = self.pp.plan(pos, gates_pos, gates_rpy, obstacles_pos)
-            trajectory.trajectory = self.path
-            self.path = self.interpolate_trajectory_linear(self.path, self._interpolation_factor)
-            # self.path = self.smoo
+            path = self.pp.plan(pos, gates_pos, gates_rpy, obstacles_pos)
+            self.path[self.tick:] = self.interpolate_to_n_points(path, NUM_POINTS)[self.tick:]
+            trajectory.trajectory = self.interpolate_to_n_points(self.path, 500)
             
 
         
         position = self.path[self.tick]
         # print(self.path[self.tick])
-        
-        self.tick += 1
-        if(self.tick >= len(self.path)):
-            self.finished = True
         
         
         return np.concatenate((position, np.zeros(10)), dtype=np.float32)
@@ -195,32 +196,84 @@ class MPC(Controller):
         
         return final_path
     
-    def interpolate_trajectory_linear(self, trajectory, interpolation_factor=2):
+    def interpolate_to_n_points(self, trajectory, target_num_points):
         """
-        Linearly interpolates between trajectory points.
+        Adjusts the trajectory to have approximately target_num_points
+        by subsampling or interpolating linearly.
 
         Parameters:
-            trajectory (np.ndarray): Original trajectory, shape (N, 13)
-            interpolation_factor (int): Number of segments per original segment.
-                                        Must be >= 1. (1 = no interpolation)
+            trajectory (np.ndarray): Original trajectory, shape (N, D)
+            target_num_points (int): Desired number of output points
 
         Returns:
-            np.ndarray: Interpolated trajectory
+            np.ndarray: Resampled trajectory
         """
-        if interpolation_factor < 1:
-            raise ValueError("interpolation_factor must be >= 1")
+        
+        if target_num_points < 2:
+            raise ValueError("target_num_points must be >= 2")
 
         N = trajectory.shape[0]
+
+        if N == target_num_points:
+            return trajectory
+
         result = []
+        
 
-        for i in range(N - 1):
-            a = trajectory[i]
-            b = trajectory[i + 1]
+        # Compute uniformly spaced positions in the original trajectory
+        step = (N - 1) / (target_num_points - 1)
 
-            for k in range(interpolation_factor):
-                alpha = k / interpolation_factor
+        for i in range(target_num_points):
+            pos = i * step
+            idx = int(np.floor(pos))
+            alpha = pos - idx
+
+            if idx >= N - 1:
+                result.append(trajectory[-1])
+            else:
+                a = trajectory[idx]
+                b = trajectory[idx + 1]
                 point = (1 - alpha) * a + alpha * b
                 result.append(point)
 
-        result.append(trajectory[-1])  # add the final point
         return np.array(result)
+    
+    # def interpolate_trajectory_linear(self, trajectory, interpolation_factor=2):
+    #     """
+    #     Linearly interpolates or subsamples the trajectory based on interpolation_factor.
+
+    #     Parameters:
+    #         trajectory (np.ndarray): Original trajectory, shape (N, D)
+    #         interpolation_factor (float): 
+    #             - f > 1.0: add points between original ones
+    #             - f < 1.0: remove points (subsample)
+    #             - f = 1.0: no change
+
+    #     Returns:
+    #         np.ndarray: Adjusted trajectory
+    #     """
+    #     if interpolation_factor <= 0:
+    #         raise ValueError("interpolation_factor must be > 0")
+
+    #     N = trajectory.shape[0]
+
+    #     # Case 1: Subsample (f < 1)
+    #     if interpolation_factor < 1.0:
+    #         stride = int(round(1 / interpolation_factor))
+    #         result = trajectory[::stride]
+    #         if not np.all(result[-1] == trajectory[-1]):
+    #             result = np.vstack([result, trajectory[-1]])
+    #         return result
+
+    #     # Case 2: Interpolate (f >= 1)
+    #     result = []
+    #     for i in range(N - 1):
+    #         a = trajectory[i]
+    #         b = trajectory[i + 1]
+    #         num_segments = int(interpolation_factor)
+    #         for k in range(num_segments):
+    #             alpha = k / interpolation_factor
+    #             point = (1 - alpha) * a + alpha * b
+    #             result.append(point)
+    #     result.append(trajectory[-1])
+    #     return np.array(result)

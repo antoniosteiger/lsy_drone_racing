@@ -5,9 +5,9 @@ import matplotlib.pyplot as plt
 
 POINTS_PER_SECTION = 100
 OBSTACLE_SIZE = [0.10, 0.10, 2.0]
-GATE_SIZE = [0.50, 0.03, 0.50]
+GATE_SIZE = [0.60, 0.03, 0.60]
 CLEARANCE = 0.22
-WAYPOINT_SPEED = 1.1
+WAYPOINT_SPEED = 1.8
 
 class PathPlanner:
     def __init__(self, pos, waypoints, tangents, obstacles_pos):
@@ -40,7 +40,7 @@ class PathPlanner:
             collision_indices, collision_obstacles = self.check_collisions(path, self.obstacles)
             if i == 0:
                 self.collision_indices = collision_indices # update for plotting
-                print(collision_indices)
+                # print(collision_indices)
             if len(self.collision_indices) > 0:
                 self.detour_waypoints, detour_tangents = self.detour(path, self.waypoints, tangents, collision_indices, collision_obstacles)
                 # print("Detour_Waypoints:\n", self.detour_waypoints)
@@ -139,7 +139,7 @@ class PathPlanner:
         # update for plotting
         self.collision_indices = edge_indices
         arr1 = np.array(edge_indices, dtype=np.int64)
-        print(f"Filtered Indices: {arr1}")
+        # print(f"Filtered Indices: {arr1}")
         return edge_indices, collision_obstacles
     
     def detour(self, path, waypoints, tangents, collision_indices, collision_obstacles):
@@ -255,7 +255,7 @@ class PathPlanner:
         # plot reroute points
         if len(self.detour_waypoints) > 0:
             ax.scatter(*self.detour_waypoints.T, color='blue')
-            print(self.detour_waypoints)
+            # print(self.detour_waypoints)
 
         if self.obstacles is not None:
             for obstacle in self.obstacles:
